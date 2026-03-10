@@ -655,6 +655,11 @@ export const RunCommand = cmd({
     await bootstrap(process.cwd(), async () => {
       const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init)
+        const password = Flag.OPENCODE_SERVER_PASSWORD
+        if (password && !request.headers.has("authorization")) {
+          const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
+          request.headers.set("authorization", `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`)
+        }
         return Server.App().fetch(request)
       }) as typeof globalThis.fetch
       const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })

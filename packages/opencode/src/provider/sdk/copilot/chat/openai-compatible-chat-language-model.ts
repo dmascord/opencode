@@ -136,6 +136,9 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV2 {
       toolChoice,
     })
 
+    const useMaxCompletionTokens =
+      this.providerOptionsName === "apim" && this.modelId.includes("gpt-5") && !this.modelId.includes("gpt-5-chat")
+
     return {
       args: {
         // model id:
@@ -145,7 +148,9 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV2 {
         user: compatibleOptions.user,
 
         // standardized settings:
-        max_tokens: maxOutputTokens,
+        ...(useMaxCompletionTokens
+          ? { max_completion_tokens: maxOutputTokens }
+          : { max_tokens: maxOutputTokens }),
         temperature,
         top_p: topP,
         frequency_penalty: frequencyPenalty,

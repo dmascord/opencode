@@ -869,27 +869,6 @@ export const SettingsProviders: Component = () => {
           </div>
         </div>
       </Show>
-                  >
-                    <div class="flex items-center gap-2">
-                      <ProviderIcon id={provider.id as IconName} class="size-5" />
-                      <span class="text-13-medium text-text-base">{provider.name}</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <Show when={isConnected}>
-                        <span class="text-10-medium text-fill-success-base">Connected</span>
-                      </Show>
-                      <Show when={support?.supported}>
-                        <span class="text-10-medium text-text-muted">Multi-account</span>
-                      </Show>
-                      <Icon name="plus-small" class="size-4 text-icon-muted" />
-                    </div>
-                  </button>
-                )
-              }}
-            </For>
-          </div>
-        </div>
-      </Show>
 
       {/* List view (default) */}
       <Show when={!detailProvider() && view() === "list"}>

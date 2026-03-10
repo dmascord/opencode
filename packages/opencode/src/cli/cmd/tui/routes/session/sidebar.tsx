@@ -1,5 +1,5 @@
 import { useSync } from "@tui/context/sync"
-import { createMemo, For, Show, Switch, Match } from "solid-js"
+import { createMemo, For, Show, Switch, Match, createSignal, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useTheme } from "../../context/theme"
 import { Locale } from "@/util/locale"
@@ -10,7 +10,92 @@ import { Installation } from "@/installation"
 import { useKeybind } from "../../context/keybind"
 import { useDirectory } from "../../context/directory"
 import { useKV } from "../../context/kv"
+import { useSDK } from "../../context/sdk"
+import { useLocal } from "../../context/local"
 import { TodoItem } from "../../component/todo-item"
+
+type ProviderQuota = {
+  _error?: string
+  codex?: {
+    accounts: unknown[]
+    codexUsage?: {
+      fiveHour?: { utilization: number; resetsAt?: string }
+      sevenDay?: { utilization: number; resetsAt?: string }
+      planType?: string
+    }
+  }
+  minimax?: {
+    accounts: unknown[]
+    minimaxUsage?: {
+      fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+    }
+  }
+  openrouter?: {
+    accounts: unknown[]
+    openrouterUsage?: {
+      isFree?: boolean
+      usage?: number
+      usageDaily?: number
+      usageWeekly?: number
+      usageMonthly?: number
+      limit?: number | null
+      limitRemaining?: number | null
+    }
+  }
+  cohere?: {
+    accounts: unknown[]
+    cohereUsage?: unknown
+  }
+  google?: {
+    accounts: unknown[]
+    geminiUsage?: unknown
+  }
+  ["github-copilot"]?: {
+    accounts: unknown[]
+    githubCopilotUsage?: {
+      hasAccess?: boolean
+      assignedDate?: string
+      lastActivityDate?: string
+      orgBillingBreakdown?: {
+        planType: string
+        totalSeats: number
+        activeSeats: number
+        inactiveSeats: number
+        pendingInvitation: number
+        pendingCancellation: number
+      }
+      organizations?: Array<{
+        name: string
+        role: string
+      }>
+      statusMessage?: string
+    }
+  }
+}
+
+function getTrackedQuotaProvider(model?: { providerID: string; modelID: string }) {
+  if (!model) return
+  if (model.providerID === "openai") return "codex" as const
+  if (model.providerID.startsWith("minimax") || model.modelID.includes("minimax")) return "minimax" as const
+  if (model.providerID === "openrouter") return "openrouter" as const
+  if (model.providerID === "cohere") return "cohere" as const
+  if (model.providerID === "google" || model.providerID === "google-vertex") return "gemini" as const
+  if (model.providerID === "github-copilot" || model.providerID === "github-copilot-enterprise") return "github-copilot" as const
+  return
+}
+
+function formatResetTime(resetsAt?: string): string {
+  if (!resetsAt) return ""
+  const reset = new Date(resetsAt)
+  const now = new Date()
+  const diffMs = reset.getTime() - now.getTime()
+  if (diffMs <= 0) return "due"
+  const totalMinutes = Math.floor(diffMs / (1000 * 60))
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
 
 export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const sync = useSync()
@@ -62,11 +147,47 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
 
   const directory = useDirectory()
   const kv = useKV()
-
+  const sdk = useSDK()
+  const local = useLocal()
+  
+  // Provider quota state
+  const [quota, setQuota] = createSignal<ProviderQuota | null>(null)
+  const [quotaLoading, setQuotaLoading] = createSignal(false)
+  
+  // Fetch quota on mount
+  onMount(async () => {
+    if (!sdk) {
+      setQuota({ _error: "SDK not available" })
+      return
+    }
+    setQuotaLoading(true)
+    try {
+       const result = await sdk.client.auth.usage({})
+       if (result.data) {
+         setQuota(result.data as ProviderQuota)
+       } else if (result.error) {
+         setQuota({ _error: result.error instanceof Error ? result.error.message : String(result.error) })
+       }
+    } catch (e) {
+      // Store error for display
+      setQuota({ _error: e instanceof Error ? e.message : String(e) })
+    }
+    setQuotaLoading(false)
+  })
+  
   const hasProviders = createMemo(() =>
     sync.data.provider.some((x) => x.id !== "opencode" || Object.values(x.models).some((y) => y.cost?.input !== 0)),
   )
   const gettingStartedDismissed = createMemo(() => kv.get("dismissed_getting_started", false))
+  const selectedModel = createMemo(() => local.model.current())
+  const selectedQuotaProvider = createMemo(() => getTrackedQuotaProvider(selectedModel()))
+  const selectedQuotaLabel = createMemo(() => {
+    const selected = selectedModel()
+    if (!selected) return
+    const provider = sync.data.provider.find((x) => x.id === selected.providerID)
+    const model = provider?.models[selected.modelID]
+    return model?.name ?? `${selected.providerID}/${selected.modelID}`
+  })
 
   return (
     <Show when={session()}>
@@ -106,6 +227,157 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
               <text fg={theme.textMuted}>{context()?.percentage ?? 0}% used</text>
               <text fg={theme.textMuted}>{cost()} spent</text>
             </box>
+            
+            {/* Provider Quota Section */}
+            <Show when={quota() && selectedQuotaProvider()}>
+              <box>
+                <text fg={theme.text}>
+                  <b>Provider Quota</b>
+                </text>
+                <Show when={selectedQuotaLabel()}>
+                  <text fg={theme.textMuted}>{selectedQuotaLabel()}</text>
+                </Show>
+
+                <Show when={quota()!._error}>
+                  <text fg={theme.error}>Error: {quota()!._error}</text>
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "codex" && quota()?.codex?.codexUsage}>
+                  <text fg={theme.text}>Codex (5h): {
+                    quota()!.codex!.codexUsage!.fiveHour 
+                      ? `${quota()!.codex!.codexUsage!.fiveHour!.utilization}% used`
+                      : "N/A"
+                  }</text>
+                  <Show when={quota()?.codex?.codexUsage?.sevenDay}>
+                    <text fg={theme.textMuted}>Codex (7d): {quota()!.codex!.codexUsage!.sevenDay!.utilization}% used</text>
+                  </Show>
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "minimax" && quota()?.minimax?.minimaxUsage?.fiveHour}>
+                  {(() => {
+                    const m = quota()!.minimax!.minimaxUsage!.fiveHour!
+                    const pctRemaining = 100 - m.utilization
+                    const remaining = pctRemaining <= 10 ? "low" : pctRemaining <= 30 ? "medium" : "good"
+                    return (
+                      <>
+                        <text fg={theme.text}>MiniMax (5h): {m.utilization}% used ({pctRemaining}% remaining)</text>
+                        <text fg={theme.textMuted}>Resets in: {formatResetTime(m.resetsAt)}</text>
+                      </>
+                    )
+                  })()}
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "openrouter" && quota()?.openrouter?.openrouterUsage}>
+                  {(() => {
+                    const o = quota()!.openrouter!.openrouterUsage!
+                    return (
+                      <>
+                        <Show when={o.isFree}>
+                          <text fg={theme.success}>OpenRouter: Free tier</text>
+                        </Show>
+                        <Show when={!o.isFree}>
+                          <text fg={theme.text}>OpenRouter: {o.usage ?? 0} requests</text>
+                        </Show>
+                        <Show when={o.usageDaily !== undefined}>
+                          <text fg={theme.textMuted}>Daily: {o.usageDaily}</text>
+                        </Show>
+                        <Show when={o.usageWeekly !== undefined}>
+                          <text fg={theme.textMuted}>Weekly: {o.usageWeekly}</text>
+                        </Show>
+                        <Show when={o.limit !== null && o.limit !== undefined}>
+                          <text fg={theme.textMuted}>Limit: {o.limit}</text>
+                        </Show>
+                      </>
+                    )
+                  })()}
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "cohere"}>
+                  <text fg={theme.text}>Cohere</text>
+                  <text fg={theme.textMuted}>Usage data not available via API</text>
+                  <text fg={theme.textMuted}>Check Cohere dashboard for usage</text>
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "gemini"}>
+                  <text fg={theme.text}>Google Gemini</text>
+                  <text fg={theme.textMuted}>Usage data not available via API</text>
+                  <text fg={theme.textMuted}>Check Google Cloud Console</text>
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "github-copilot"}>
+                  <text fg={theme.text}>GitHub Copilot</text>
+                  {(() => {
+                    const usage = quota()?.["github-copilot"]?.githubCopilotUsage
+                    if (!usage) return <text fg={theme.textMuted}>Loading...</text>
+
+                    return (
+                      <>
+                        <Show when={usage.orgBillingBreakdown}>
+                          {(org) => (
+                            <>
+                              <text fg={theme.text}>Organization Plan</text>
+                              <text fg={theme.textMuted}>{org().planType}</text>
+                              <text fg={theme.textMuted}>
+                                Seats: {org().activeSeats}/{org().totalSeats} active
+                              </text>
+                              <Show when={org().inactiveSeats > 0}>
+                                <text fg={theme.textMuted}>{org().inactiveSeats} inactive</text>
+                              </Show>
+                            </>
+                          )}
+                        </Show>
+
+                        <Show when={usage.hasAccess && !usage.orgBillingBreakdown}>
+                          <text fg={theme.success}>✓ Copilot Seat Assigned</text>
+                          <Show when={usage.assignedDate}>
+                            {(date) => <text fg={theme.textMuted}>Assigned: {new Date(date()).toLocaleDateString()}</text>}
+                          </Show>
+                          <Show when={usage.lastActivityDate}>
+                            {(date) => {
+                              const last = new Date(date())
+                              const now = new Date()
+                              const daysSince = Math.floor((now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24))
+                              return (
+                                <text fg={theme.textMuted}>
+                                  Last active: {daysSince === 0 ? "today" : `${daysSince}d ago`}
+                                </text>
+                              )
+                            }}
+                          </Show>
+                        </Show>
+
+                        <Show when={!usage.hasAccess && !usage.orgBillingBreakdown && usage.organizations?.length}>
+                          <text fg={theme.textMuted}>Member of {usage.organizations!.length} organization(s)</text>
+                          <text fg={theme.textMuted}>No Copilot seat found</text>
+                        </Show>
+
+                        <Show when={usage.statusMessage}>
+                          {(msg) => <text fg={theme.textMuted}>{msg()}</text>}
+                        </Show>
+                      </>
+                    )
+                  })()}
+                </Show>
+
+                <Show
+                  when={
+                    !quota()!._error &&
+                    ((selectedQuotaProvider() === "codex" && !quota()?.codex?.codexUsage) ||
+                      (selectedQuotaProvider() === "minimax" && !quota()?.minimax?.minimaxUsage?.fiveHour) ||
+                      (selectedQuotaProvider() === "openrouter" && !quota()?.openrouter?.openrouterUsage) ||
+                      (selectedQuotaProvider() === "cohere" && !quota()?.cohere?.cohereUsage) ||
+                      (selectedQuotaProvider() === "gemini" && !quota()?.google?.geminiUsage) ||
+                      (selectedQuotaProvider() === "github-copilot" && !quota()?.["github-copilot"]?.githubCopilotUsage))
+                  }
+                >
+                  <text fg={theme.textMuted}>No live quota data for current model</text>
+                </Show>
+              </box>
+            </Show>
+            <Show when={quotaLoading()}>
+              <text fg={theme.textMuted}>Loading quota...</text>
+            </Show>
+            
             <Show when={mcpEntries().length > 0}>
               <box>
                 <box

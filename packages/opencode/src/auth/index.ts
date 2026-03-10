@@ -782,5 +782,366 @@ export namespace Auth {
         clearTimeout(timeout)
       }
     }
+
+    export async function fetchCodexUsage(): Promise<{
+      fiveHour?: { utilization: number; resetsAt?: string }
+      sevenDay?: { utilization: number; resetsAt?: string }
+      planType?: string
+    } | null> {
+      // Read Codex auth tokens from ~/.codex/auth.json
+      const codexAuthPath = path.join(process.env.HOME || "", ".codex", "auth.json")
+      
+      try {
+        const codexAuthData = await fs.readFile(codexAuthPath, "utf-8")
+        const codexAuth = JSON.parse(codexAuthData)
+        
+        let accessToken: string | undefined
+        let accountId: string | undefined
+        
+        // Check for API key
+        if (codexAuth.OPENAI_API_KEY) {
+          // Using API key - can't get usage
+          return { fiveHour: { utilization: 0, resetsAt: undefined }, sevenDay: { utilization: 0, resetsAt: undefined } }
+        }
+        
+        // OAuth tokens
+        if (codexAuth.tokens?.access_token) {
+          accessToken = codexAuth.tokens.access_token
+          accountId = codexAuth.tokens.account_id
+        } else {
+          return null
+        }
+
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 5000)
+
+        try {
+          const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${accessToken}`,
+              "ChatGPT-Account-Id": accountId || "",
+              "User-Agent": "opencode/1.0",
+            },
+            signal: controller.signal,
+          })
+
+          if (!response.ok) return null
+
+          const data = (await response.json()) as {
+            rate_limit?: {
+              primary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+              secondary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+            }
+            plan_type?: string
+          }
+
+          return {
+            fiveHour: data.rate_limit?.primary_window
+              ? { utilization: Math.round(data.rate_limit.primary_window.used_percent), resetsAt: new Date(data.rate_limit.primary_window.reset_at * 1000).toISOString() }
+              : undefined,
+            sevenDay: data.rate_limit?.secondary_window
+              ? { utilization: Math.round(data.rate_limit.secondary_window.used_percent), resetsAt: new Date(data.rate_limit.secondary_window.reset_at * 1000).toISOString() }
+              : undefined,
+            planType: data.plan_type,
+          }
+        } catch {
+          return null
+        } finally {
+          clearTimeout(timeout)
+        }
+      } catch {
+        return null
+      }
+    }
+
+     export async function fetchMiniMaxUsage(): Promise<{
+       fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+     } | null> {
+       // Read MiniMax API key from environment or config
+       const apiKey = process.env.MINIMAX_API_KEY
+       if (!apiKey) return null
+
+       const controller = new AbortController()
+       const timeout = setTimeout(() => controller.abort(), 5000)
+
+       try {
+         const response = await fetch("https://www.minimax.io/v1/api/openplatform/coding_plan/remains", {
+           method: "GET",
+           headers: {
+             Accept: "application/json",
+             "Content-Type": "application/json",
+             Authorization: `Bearer ${apiKey}`,
+             "User-Agent": "opencode/1.0",
+           },
+           signal: controller.signal,
+         })
+
+         if (!response.ok) return null
+
+         const data = (await response.json()) as {
+           model_remains?: Array<{
+             current_interval_total_count: number
+             current_interval_usage_count: number // This is actually remaining credits!
+             end_time: number
+             model_name: string
+           }>
+         }
+
+         if (!data.model_remains || data.model_remains.length === 0) return null
+
+         const modelRemain = data.model_remains[0]
+         const totalCredits = modelRemain.current_interval_total_count
+         const remainingCredits = modelRemain.current_interval_usage_count
+         const usedCredits = totalCredits - remainingCredits
+         const utilization = Math.round((usedCredits / totalCredits) * 100)
+
+         return {
+           fiveHour: {
+             utilization,
+             resetsAt: new Date(modelRemain.end_time).toISOString(),
+             remainingCredits,
+             totalCredits,
+           },
+         }
+       } catch {
+         return null
+       } finally {
+         clearTimeout(timeout)
+       }
+     }
+
+     export async function fetchOpenRouterUsage(): Promise<{
+       isFree?: boolean
+       usage?: number
+       usageDaily?: number
+       usageWeekly?: number
+       usageMonthly?: number
+       limit?: number | null
+       limitRemaining?: number | null
+     } | null> {
+       // Read OpenRouter API key from environment
+       const apiKey = process.env.OPENROUTER_API_KEY
+       if (!apiKey) return null
+
+       const controller = new AbortController()
+       const timeout = setTimeout(() => controller.abort(), 5000)
+
+       try {
+         const response = await fetch("https://openrouter.ai/api/v1/auth/key", {
+           method: "GET",
+           headers: {
+             Accept: "application/json",
+             Authorization: `Bearer ${apiKey}`,
+             "User-Agent": "opencode/1.0",
+           },
+           signal: controller.signal,
+         })
+
+         if (!response.ok) return null
+
+         const data = (await response.json()) as {
+           data: {
+             usage: number
+             usage_daily: number
+             usage_weekly: number
+             usage_monthly: number
+             limit: number | null
+             limit_remaining: number | null
+             is_free_tier: boolean
+           }
+         }
+
+         return {
+           isFree: data.data.is_free_tier,
+           usage: data.data.usage,
+           usageDaily: data.data.usage_daily,
+           usageWeekly: data.data.usage_weekly,
+           usageMonthly: data.data.usage_monthly,
+           limit: data.data.limit,
+           limitRemaining: data.data.limit_remaining,
+         }
+        } catch {
+          return null
+        } finally {
+          clearTimeout(timeout)
+        }
+      }
+
+      export async function fetchGitHubCopilotUsage(): Promise<{
+        hasAccess?: boolean
+        assignedDate?: string
+        lastActivityDate?: string
+        orgBillingBreakdown?: {
+          planType: string
+          totalSeats: number
+          activeSeats: number
+          inactiveSeats: number
+          pendingInvitation: number
+          pendingCancellation: number
+        }
+        organizations?: Array<{
+          name: string
+          role: string
+        }>
+        statusMessage?: string
+      } | null> {
+        const store = await loadStoreFile()
+        const provider = store.providers["github-copilot"]
+        if (!provider || provider.type !== "oauth") return null
+
+        const orderedIDs = recordIDsForNamespace(provider, "default")
+        const now = Date.now()
+        const activeID =
+          provider.active["default"] ??
+          orderedIDs.find((id) => {
+            const rec = provider.records.find((r) => r.id === id)
+            const cooldownUntil = rec?.health.cooldownUntil
+            return !cooldownUntil || cooldownUntil <= now
+          }) ??
+          orderedIDs[0]
+        const record = provider.records.find((r) => r.id === activeID && r.namespace === "default")
+        if (!record?.access) return null
+
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 5000)
+
+        try {
+          // First, get user info
+          const userResponse = await fetch("https://api.github.com/user", {
+            method: "GET",
+            headers: {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${record.access}`,
+              "User-Agent": "opencode/1.0",
+            },
+            signal: controller.signal,
+          })
+
+          if (!userResponse.ok) return null
+
+          const userData = (await userResponse.json()) as {
+            login: string
+          }
+
+          const username = userData.login
+
+          // Get user's organizations
+          const orgsResponse = await fetch("https://api.github.com/user/orgs", {
+            method: "GET",
+            headers: {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${record.access}`,
+              "User-Agent": "opencode/1.0",
+            },
+            signal: controller.signal,
+          })
+
+          if (!orgsResponse.ok) return null
+
+          const orgsData = (await orgsResponse.json()) as Array<{
+            login: string
+          }>
+
+          const result: {
+            hasAccess?: boolean
+            assignedDate?: string
+            lastActivityDate?: string
+            orgBillingBreakdown?: {
+              planType: string
+              totalSeats: number
+              activeSeats: number
+              inactiveSeats: number
+              pendingInvitation: number
+              pendingCancellation: number
+            }
+            organizations?: Array<{ name: string; role: string }>
+            statusMessage?: string
+          } = {}
+
+          // Try to find org with admin access and Copilot billing info
+          for (const org of orgsData) {
+            const billingResponse = await fetch(`https://api.github.com/orgs/${org.login}/copilot/billing`, {
+              method: "GET",
+              headers: {
+                Accept: "application/vnd.github+json",
+                Authorization: `Bearer ${record.access}`,
+                "User-Agent": "opencode/1.0",
+              },
+              signal: controller.signal,
+            }).catch(() => null)
+
+            if (billingResponse?.ok) {
+              const billingData = (await billingResponse.json()) as {
+                seat_breakdown: {
+                  total: number
+                  active_this_cycle: number
+                  inactive_this_cycle: number
+                  pending_invitation: number
+                  pending_cancellation: number
+                }
+                plan_type: string
+              }
+
+              result.orgBillingBreakdown = {
+                planType: billingData.plan_type,
+                totalSeats: billingData.seat_breakdown.total,
+                activeSeats: billingData.seat_breakdown.active_this_cycle,
+                inactiveSeats: billingData.seat_breakdown.inactive_this_cycle,
+                pendingInvitation: billingData.seat_breakdown.pending_invitation,
+                pendingCancellation: billingData.seat_breakdown.pending_cancellation,
+              }
+              break // Found admin access to org, use this data
+            }
+          }
+
+          // Try to find user's seat in any org
+          for (const org of orgsData) {
+            const seatsResponse = await fetch(`https://api.github.com/orgs/${org.login}/copilot/billing/seats`, {
+              method: "GET",
+              headers: {
+                Accept: "application/vnd.github+json",
+                Authorization: `Bearer ${record.access}`,
+                "User-Agent": "opencode/1.0",
+              },
+              signal: controller.signal,
+            }).catch(() => null)
+
+            if (seatsResponse?.ok) {
+              const seatsData = (await seatsResponse.json()) as {
+                seats: Array<{
+                  login: string
+                  assigned_date: string
+                  last_activity_date: string
+                }>
+              }
+
+              const userSeat = seatsData.seats.find((s) => s.login === username)
+              if (userSeat) {
+                result.hasAccess = true
+                result.assignedDate = userSeat.assigned_date
+                result.lastActivityDate = userSeat.last_activity_date
+                break // Found user's seat
+              }
+            }
+          }
+
+          result.organizations = orgsData.map((org) => ({
+            name: org.login,
+            role: "member",
+          }))
+
+          if (!result.hasAccess && !result.orgBillingBreakdown) {
+            result.statusMessage = "GitHub Copilot not directly accessible via API"
+          }
+
+          return result
+        } catch {
+          return null
+        } finally {
+          clearTimeout(timeout)
+        }
+      }
+    }
   }
-}

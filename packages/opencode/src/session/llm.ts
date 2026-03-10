@@ -26,6 +26,28 @@ import { Auth } from "@/auth"
 export namespace LLM {
   const log = Log.create({ service: "llm" })
   export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+  const APIM_MAX_ACTIVE_TOOLS = 128
+  const APIM_CORE_TOOL_ORDER = [
+    "task",
+    "bash",
+    "read",
+    "glob",
+    "grep",
+    "apply_patch",
+    "edit",
+    "write",
+    "webfetch",
+    "todoread",
+    "todowrite",
+    "question",
+    "skill",
+    "websearch",
+    "codesearch",
+    "batch",
+    "lsp",
+    "planexit",
+  ]
+  const APIM_CORE_TOOL_PRIORITY = new Map(APIM_CORE_TOOL_ORDER.map((name, index) => [name, index]))
 
   export type StreamInput = {
     user: MessageV2.User
@@ -147,7 +169,7 @@ export namespace LLM {
     const maxOutputTokens =
       isCodex || provider.id.includes("github-copilot") ? undefined : ProviderTransform.maxOutputTokens(input.model)
 
-    const tools = await resolveTools(input)
+    let tools = await resolveTools(input)
 
     // LiteLLM and some Anthropic proxies require the tools parameter to be present
     // when message history contains tool calls, even if no tools are being used.
@@ -167,6 +189,45 @@ export namespace LLM {
         inputSchema: jsonSchema({ type: "object", properties: {} }),
         execute: async () => ({ output: "", title: "", metadata: {} }),
       })
+    }
+
+    if (input.model.providerID === "apim") {
+      const invalidEntry = Object.entries(tools).find(([name]) => name === "invalid")
+      const activeEntries = Object.entries(tools).filter(([name]) => name !== "invalid")
+      const referencedTools = referencedToolNames(input.messages)
+      const requiredTools = requiredToolNames(input.toolChoice)
+
+      if (activeEntries.length > APIM_MAX_ACTIVE_TOOLS) {
+        const ranked = activeEntries
+          .map(([name, value], index) => ({
+            name,
+            value,
+            index,
+            referenced: referencedTools.has(name),
+            required: requiredTools.has(name),
+            corePriority: APIM_CORE_TOOL_PRIORITY.get(name) ?? Number.POSITIVE_INFINITY,
+          }))
+          .sort((a, b) => {
+            if (a.required !== b.required) return a.required ? -1 : 1
+            if (a.referenced !== b.referenced) return a.referenced ? -1 : 1
+            if (a.corePriority !== b.corePriority) return a.corePriority - b.corePriority
+            return a.index - b.index
+          })
+        const kept = ranked
+          .slice(0, APIM_MAX_ACTIVE_TOOLS)
+          .sort((a, b) => a.index - b.index)
+        const dropped = ranked.slice(APIM_MAX_ACTIVE_TOOLS).map((item) => item.name)
+        tools = Object.fromEntries(kept.map((item) => [item.name, item.value]))
+        if (invalidEntry) tools.invalid = invalidEntry[1]
+        l.warn("capping apim tools to provider limit", {
+          limit: APIM_MAX_ACTIVE_TOOLS,
+          kept: kept.length,
+          dropped: activeEntries.length - kept.length,
+          requiredKept: kept.filter((item) => item.required).map((item) => item.name),
+          referencedKept: kept.filter((item) => item.referenced).map((item) => item.name),
+          droppedTools: dropped.slice(0, 10),
+        })
+      }
     }
 
     return streamText({
@@ -275,5 +336,32 @@ export namespace LLM {
       }
     }
     return false
+  }
+
+  function referencedToolNames(messages: ModelMessage[]) {
+    const result = new Set<string>()
+    for (const msg of messages) {
+      if (!Array.isArray(msg.content)) continue
+      for (const part of msg.content) {
+        if ((part.type === "tool-call" || part.type === "tool-result") && typeof part.toolName === "string") {
+          result.add(part.toolName)
+        }
+      }
+    }
+    return result
+  }
+
+  function requiredToolNames(toolChoice: StreamInput["toolChoice"]) {
+    const result = new Set<string>()
+    const maybeToolChoice = toolChoice as unknown
+    if (
+      maybeToolChoice &&
+      typeof maybeToolChoice === "object" &&
+      "toolName" in maybeToolChoice &&
+      typeof maybeToolChoice.toolName === "string"
+    ) {
+      result.add(maybeToolChoice.toolName)
+    }
+    return result
   }
 }

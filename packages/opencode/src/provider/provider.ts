@@ -158,6 +158,18 @@ export namespace Provider {
         options: {},
       }
     },
+    apim: async () => {
+      return {
+        autoload: false,
+        async getModel(sdk: any, modelID: string, options?: Record<string, any>) {
+          if (options?.["useCompletionUrls"]) {
+            return sdk.chat(modelID)
+          }
+          return sdk.responses(modelID)
+        },
+        options: {},
+      }
+    },
     "github-copilot": async () => {
       return {
         autoload: false,

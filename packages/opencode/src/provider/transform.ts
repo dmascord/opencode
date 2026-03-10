@@ -757,9 +757,13 @@ export namespace ProviderTransform {
     }
 
     if (input.model.api.id.includes("gpt-5") && !input.model.api.id.includes("gpt-5-chat")) {
+      const isApimProvider = input.model.providerID === "apim"
+
       if (!input.model.api.id.includes("gpt-5-pro")) {
-        result["reasoningEffort"] = "medium"
-        result["reasoningSummary"] = "auto"
+        result["reasoningEffort"] = isApimProvider ? "high" : "medium"
+        if (!isApimProvider) {
+          result["reasoningSummary"] = "auto"
+        }
       }
 
       // Only set textVerbosity for non-chat gpt-5.x models
@@ -768,7 +772,8 @@ export namespace ProviderTransform {
         input.model.api.id.includes("gpt-5.") &&
         !input.model.api.id.includes("codex") &&
         !input.model.api.id.includes("-chat") &&
-        input.model.providerID !== "azure"
+        input.model.providerID !== "azure" &&
+        !isApimProvider
       ) {
         result["textVerbosity"] = "low"
       }

@@ -27,6 +27,16 @@ interface AnthropicUsage {
   sevenDaySonnet?: { utilization: number; resetsAt?: string }
 }
 
+interface CodexUsage {
+  fiveHour?: { utilization: number; resetsAt?: string }
+  sevenDay?: { utilization: number; resetsAt?: string }
+  planType?: string
+}
+
+interface MiniMaxUsage {
+  fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+}
+
 interface AccountUsage {
   id: string
   label?: string
@@ -37,6 +47,8 @@ interface AccountUsage {
 interface ProviderUsageData {
   accounts: AccountUsage[]
   anthropicUsage?: AnthropicUsage
+  codexUsage?: CodexUsage
+  minimaxUsage?: MiniMaxUsage
 }
 
 interface SessionContextTabProps {
@@ -252,6 +264,157 @@ function AnthropicUsageSection() {
       <Show when={!usage.loading && !usage()}>
         <div class="text-11-regular text-text-muted p-2 rounded bg-surface-base">
           No Anthropic OAuth account connected.
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+function CodexUsageSection() {
+  const globalSDK = useGlobalSDK()
+
+  const [usage, { refetch }] = createResource(async () => {
+    const result = await globalSDK.client.auth.usage({})
+    const data = result.data as Record<string, ProviderUsageData>
+    return data["codex"]?.codexUsage
+  })
+
+  const rateLimits = createMemo(() => {
+    const data = usage()
+    if (!data) return []
+
+    const limits: { key: string; label: string; utilization: number; resetsAt?: string; color: string }[] = []
+
+    if (data.fiveHour) {
+      limits.push({
+        key: "5h",
+        label: "5-Hour",
+        utilization: data.fiveHour.utilization,
+        resetsAt: data.fiveHour.resetsAt,
+        color: getUsageColor(data.fiveHour.utilization),
+      })
+    }
+    if (data.sevenDay) {
+      limits.push({
+        key: "7d",
+        label: "Weekly",
+        utilization: data.sevenDay.utilization,
+        resetsAt: data.sevenDay.resetsAt,
+        color: getUsageColor(data.sevenDay.utilization),
+      })
+    }
+
+    return limits
+  })
+
+  return (
+    <div class="flex flex-col gap-2">
+      <div class="text-12-regular text-text-weak">OpenAI Codex (OAuth)</div>
+
+      <Show when={usage.loading}>
+        <div class="flex items-center justify-center py-4">
+          <Spinner class="size-4" />
+        </div>
+      </Show>
+
+      <Show when={!usage.loading && usage()}>
+        {(data) => (
+          <>
+            <Show when={data().planType}>
+              <div class="text-11-regular text-text-muted">Plan: {data().planType}</div>
+            </Show>
+            <Show when={rateLimits().length > 0}>
+              <For each={rateLimits()}>
+                {(limit) => (
+                  <div class="flex flex-col gap-1">
+                    <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                      <div class="size-2 rounded-sm" style={{ "background-color": limit.color }} />
+                      <div>{limit.label}</div>
+                      <div class="text-text-weaker">{limit.utilization}% used</div>
+                      <Show when={limit.resetsAt}>
+                        <div class="text-text-weaker ml-auto">resets {formatResetTime(limit.resetsAt)}</div>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </Show>
+            <button
+              type="button"
+              class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start mt-1"
+              onClick={() => refetch()}
+            >
+              Refresh
+            </button>
+          </>
+        )}
+      </Show>
+
+      <Show when={!usage.loading && !usage()}>
+        <div class="text-11-regular text-text-muted p-2 rounded bg-surface-base">
+          No Codex session detected. Run `codex` to authenticate.
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+function MiniMaxUsageSection() {
+  const globalSDK = useGlobalSDK()
+
+  const [usage, { refetch }] = createResource(async () => {
+    const result = await globalSDK.client.auth.usage({})
+    const data = result.data as Record<string, ProviderUsageData>
+    return data["minimax"]?.minimaxUsage
+  })
+
+  return (
+    <div class="flex flex-col gap-2">
+      <div class="text-12-regular text-text-weak">MiniMax (API Key)</div>
+
+      <Show when={usage.loading}>
+        <div class="flex items-center justify-center py-4">
+          <Spinner class="size-4" />
+        </div>
+      </Show>
+
+      <Show when={!usage.loading && usage()}>
+        {(data) => (
+          <>
+            <Show when={data().fiveHour}>
+              <div class="flex flex-col gap-1">
+                <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                  <div
+                    class="size-2 rounded-sm"
+                    style={{ "background-color": getUsageColor(data().fiveHour!.utilization) }}
+                  />
+                  <div>5-Hour Window</div>
+                  <div class="text-text-weaker">{data().fiveHour!.utilization}% used</div>
+                  <Show when={data().fiveHour!.resetsAt}>
+                    <div class="text-text-weaker ml-auto">
+                      resets {formatResetTime(data().fiveHour!.resetsAt)}
+                    </div>
+                  </Show>
+                </div>
+                <div class="text-10-regular text-text-weaker pl-3">
+                  {data().fiveHour!.remainingCredits}/{data().fiveHour!.totalCredits} credits remaining
+                </div>
+              </div>
+            </Show>
+            <button
+              type="button"
+              class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start mt-1"
+              onClick={() => refetch()}
+            >
+              Refresh
+            </button>
+          </>
+        )}
+      </Show>
+
+      <Show when={!usage.loading && !usage()}>
+        <div class="text-11-regular text-text-muted p-2 rounded bg-surface-base">
+          No MiniMax API key configured. Set MINIMAX_API_KEY.
         </div>
       </Show>
     </div>
@@ -543,6 +706,12 @@ export function SessionContextTab() {
         <Show when={ctx()?.provider?.id === "anthropic"}>
           <AnthropicUsageSection />
         </Show>
+
+        {/* Codex Rate Limits - show when available */}
+        <CodexUsageSection />
+
+        {/* MiniMax Rate Limits - show when available */}
+        <MiniMaxUsageSection />
 
         <Show when={systemPrompt()}>
           {(prompt) => (
