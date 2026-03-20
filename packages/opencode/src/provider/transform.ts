@@ -49,6 +49,52 @@ export namespace ProviderTransform {
     model: Provider.Model,
     options: Record<string, unknown>,
   ): ModelMessage[] {
+    const apiID = model.api.id.toLowerCase()
+
+    if (
+      model.providerID === "groq" &&
+      (apiID === "compound" ||
+        apiID === "compound-mini" ||
+        apiID.endsWith("/compound") ||
+        apiID.endsWith("/compound-mini"))
+    ) {
+      const stripReasoningProviderOptions = (providerOptions: Record<string, any> | undefined) => {
+        if (!providerOptions) return providerOptions
+        const result = { ...providerOptions }
+        for (const key of Object.keys(result)) {
+          const value = result[key]
+          if (!value || typeof value !== "object" || Array.isArray(value)) continue
+          const next = { ...value }
+          delete next.reasoning_content
+          delete next.reasoning_details
+          delete next.reasoning_text
+          delete next.reasoning_opaque
+          result[key] = next
+        }
+        return result
+      }
+
+      msgs = msgs.map((msg) => {
+        if (msg.role !== "assistant" || !Array.isArray(msg.content)) {
+          return {
+            ...msg,
+            providerOptions: stripReasoningProviderOptions(msg.providerOptions),
+          }
+        }
+
+        return {
+          ...msg,
+          providerOptions: stripReasoningProviderOptions(msg.providerOptions),
+          content: msg.content
+            .filter((part) => part.type !== "reasoning")
+            .map((part) => ({
+              ...part,
+              providerOptions: stripReasoningProviderOptions(part.providerOptions),
+            })),
+        }
+      })
+    }
+
     // Anthropic rejects messages with empty content - filter out empty string messages
     // and remove empty text/reasoning parts from array content
     if (model.api.npm === "@ai-sdk/anthropic") {

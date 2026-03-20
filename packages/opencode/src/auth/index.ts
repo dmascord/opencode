@@ -128,6 +128,18 @@ export namespace Auth {
     return meta
   }
 
+  function claims(token: string) {
+    const parts = token.split(".")
+    if (parts.length !== 3) return
+    try {
+      return JSON.parse(Buffer.from(parts[1], "base64url").toString()) as {
+        email?: string
+      }
+    } catch {
+      return
+    }
+  }
+
   async function ensureDataDir(): Promise<void> {
     await fs.mkdir(path.dirname(filepath), { recursive: true })
   }
@@ -504,6 +516,19 @@ export namespace Auth {
     })
   }
 
+  // Cache for MiniMax quota (30 minute TTL to avoid rate limiting)
+  let minimaxCache:
+    | {
+        data: {
+          fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+          _error?: string
+          _cached?: boolean
+        } | null
+        timestamp: number
+      }
+    | null = null
+  const MINIMAX_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
+
   export namespace OAuthPool {
     export async function snapshot(
       providerID: string,
@@ -787,143 +812,271 @@ export namespace Auth {
       fiveHour?: { utilization: number; resetsAt?: string }
       sevenDay?: { utilization: number; resetsAt?: string }
       planType?: string
+      source?: string
+      account?: {
+        id?: string
+        label?: string
+        email?: string
+      }
+      raw?: {
+        rate_limit?: {
+          primary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+          secondary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+        }
+        plan_type?: string
+      }
+      _error?: string
     } | null> {
-      // Read Codex auth tokens from ~/.codex/auth.json
-      const codexAuthPath = path.join(process.env.HOME || "", ".codex", "auth.json")
-      
-      try {
-        const codexAuthData = await fs.readFile(codexAuthPath, "utf-8")
-        const codexAuth = JSON.parse(codexAuthData)
-        
-        let accessToken: string | undefined
-        let accountId: string | undefined
-        
-        // Check for API key
-        if (codexAuth.OPENAI_API_KEY) {
-          // Using API key - can't get usage
-          return { fiveHour: { utilization: 0, resetsAt: undefined }, sevenDay: { utilization: 0, resetsAt: undefined } }
-        }
-        
-        // OAuth tokens
-        if (codexAuth.tokens?.access_token) {
-          accessToken = codexAuth.tokens.access_token
-          accountId = codexAuth.tokens.account_id
-        } else {
-          return null
-        }
-
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 5000)
-
-        try {
-          const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-            method: "GET",
-            headers: {
-              Accept: "application/json",
-              Authorization: `Bearer ${accessToken}`,
-              "ChatGPT-Account-Id": accountId || "",
-              "User-Agent": "opencode/1.0",
-            },
-            signal: controller.signal,
-          })
-
-          if (!response.ok) return null
-
-          const data = (await response.json()) as {
-            rate_limit?: {
-              primary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
-              secondary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
-            }
-            plan_type?: string
+      // Read Codex auth tokens - try OpenCode OAuth pool first, then Codex CLI
+      let accessToken: string | undefined
+      let accountId: string | undefined
+      let tokenSource: string | undefined
+      let account:
+        | {
+            id?: string
+            label?: string
+            email?: string
           }
+        | undefined
 
-          return {
-            fiveHour: data.rate_limit?.primary_window
-              ? { utilization: Math.round(data.rate_limit.primary_window.used_percent), resetsAt: new Date(data.rate_limit.primary_window.reset_at * 1000).toISOString() }
-              : undefined,
-            sevenDay: data.rate_limit?.secondary_window
-              ? { utilization: Math.round(data.rate_limit.secondary_window.used_percent), resetsAt: new Date(data.rate_limit.secondary_window.reset_at * 1000).toISOString() }
-              : undefined,
-            planType: data.plan_type,
+      // Try OpenCode OAuth pool first (supports multiple accounts)
+      try {
+        const store = await loadStoreFile()
+        const openaiProvider = store.providers?.openai
+        if (openaiProvider?.type === "oauth") {
+          const namespace = "default"
+          const activeID = openaiProvider.active?.[namespace]
+          const orderedIDs = openaiProvider.order?.[namespace] || []
+          const recordID = activeID && orderedIDs.includes(activeID) ? activeID : orderedIDs[0]
+          const record = openaiProvider.records?.find((r) => r.id === recordID)
+          if (record?.access) {
+            accessToken = record.access
+            accountId = record.accountId
+            tokenSource = "opencode-oauth-pool"
+            const meta = toMeta(record)
+            account = {
+              id: meta.accountId,
+              label: meta.label,
+              email: claims(record.access)?.email,
+            }
+          }
+        }
+      } catch {
+        // Fall through to try Codex CLI
+      }
+
+      // Fall back to Codex CLI auth.json if no OAuth pool token
+      if (!accessToken) {
+        const codexAuthPath = path.join(process.env.HOME || "", ".codex", "auth.json")
+        
+        try {
+          const codexAuthData = await fs.readFile(codexAuthPath, "utf-8")
+          const codexAuth = JSON.parse(codexAuthData)
+          
+          // Check for API key
+          if (codexAuth.OPENAI_API_KEY) {
+            // Using API key - can't get usage
+            return { fiveHour: { utilization: 0, resetsAt: undefined }, sevenDay: { utilization: 0, resetsAt: undefined } }
+          }
+          
+          // OAuth tokens
+          if (codexAuth.tokens?.access_token) {
+            accessToken = codexAuth.tokens.access_token
+            accountId = codexAuth.tokens.account_id
+            tokenSource = "codex-cli"
+            account = {
+              id: codexAuth.tokens.account_id,
+              email: claims(codexAuth.tokens.access_token)?.email,
+            }
+          } else {
+            return null
           }
         } catch {
           return null
-        } finally {
-          clearTimeout(timeout)
+        }
+      }
+
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000)
+
+      try {
+        const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${accessToken}`,
+            "ChatGPT-Account-Id": accountId || "",
+            "User-Agent": "opencode/1.0",
+          },
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          return {
+            source: tokenSource,
+            account,
+            _error: `Codex quota request failed (${response.status})`,
+          }
+        }
+
+        const data = (await response.json()) as {
+          rate_limit?: {
+            primary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+            secondary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+          }
+          plan_type?: string
+        }
+
+        return {
+          fiveHour: data.rate_limit?.primary_window
+            ? { utilization: Math.round(data.rate_limit.primary_window.used_percent), resetsAt: new Date(data.rate_limit.primary_window.reset_at * 1000).toISOString() }
+            : undefined,
+          sevenDay: data.rate_limit?.secondary_window
+            ? { utilization: Math.round(data.rate_limit.secondary_window.used_percent), resetsAt: new Date(data.rate_limit.secondary_window.reset_at * 1000).toISOString() }
+            : undefined,
+          planType: data.plan_type,
+          source: tokenSource,
+          account,
+          raw: data,
         }
       } catch {
         return null
+      } finally {
+        clearTimeout(timeout)
       }
     }
 
-     export async function fetchMiniMaxUsage(): Promise<{
-       fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
-     } | null> {
-       // Read MiniMax API key from environment or config
-       const apiKey = process.env.MINIMAX_API_KEY
-       if (!apiKey) return null
+      export async function fetchMiniMaxUsage(): Promise<{
+        fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+        _error?: string
+        _cached?: boolean
+      } | null> {
+        // Check cache first
+        const now = Date.now()
+        if (minimaxCache && now - minimaxCache.timestamp < MINIMAX_CACHE_TTL) {
+          return { ...minimaxCache.data, _cached: true }
+        }
 
-       const controller = new AbortController()
-       const timeout = setTimeout(() => controller.abort(), 5000)
+        // Read MiniMax API key from environment or auth store
+        let apiKey = process.env.MINIMAX_API_KEY
+        if (!apiKey) {
+          const authInfo = await Auth.get("minimax")
+          if (authInfo?.type === "api") {
+            apiKey = authInfo.key
+          }
+        }
+        if (!apiKey) return { _error: "No MiniMax API key configured" }
 
-       try {
-         const response = await fetch("https://www.minimax.io/v1/api/openplatform/coding_plan/remains", {
-           method: "GET",
-           headers: {
-             Accept: "application/json",
-             "Content-Type": "application/json",
-             Authorization: `Bearer ${apiKey}`,
-             "User-Agent": "opencode/1.0",
-           },
-           signal: controller.signal,
-         })
+        // Try platform.minimax.io with browser-like headers
+        // The cookies help avoid Cloudflare blocks
+        const domains = ["platform.minimax.io", "platform.minimaxi.com"]
 
-         if (!response.ok) return null
+        for (const domain of domains) {
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 5000)
 
-         const data = (await response.json()) as {
-           model_remains?: Array<{
-             current_interval_total_count: number
-             current_interval_usage_count: number // This is actually remaining credits!
-             end_time: number
-             model_name: string
-           }>
-         }
+          try {
+            const response = await fetch(`https://${domain}/v1/api/openplatform/coding_plan/remains`, {
+              method: "GET",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${apiKey}`,
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "sec-ch-ua": '"Chromium";v="120", "Not-A.Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                Referer: "https://platform.minimax.io/user-center/payment/coding-plan",
+              },
+              signal: controller.signal,
+            })
 
-         if (!data.model_remains || data.model_remains.length === 0) return null
+            if (!response.ok) {
+              const errorText = await response.text().catch(() => "")
+              // If rate limited, return cached data if available
+              if (response.status === 403 || response.status === 429) {
+                if (minimaxCache) {
+                  return { ...minimaxCache.data, _error: "Rate limited - returning cached data", _cached: true }
+                }
+                return { _error: `MiniMax API rate limited (${response.status})` }
+              }
+              return { _error: `MiniMax API error (${response.status}): ${errorText.slice(0, 100)}` }
+            }
 
-         const modelRemain = data.model_remains[0]
-         const totalCredits = modelRemain.current_interval_total_count
-         const remainingCredits = modelRemain.current_interval_usage_count
-         const usedCredits = totalCredits - remainingCredits
-         const utilization = Math.round((usedCredits / totalCredits) * 100)
+            const data = (await response.json()) as {
+              model_remains?: Array<{
+                current_interval_total_count: number
+                current_interval_usage_count: number // This is actually remaining credits!
+                end_time: number
+                model_name: string
+              }>
+              base_resp?: { status_msg?: string }
+            }
 
-         return {
-           fiveHour: {
-             utilization,
-             resetsAt: new Date(modelRemain.end_time).toISOString(),
-             remainingCredits,
-             totalCredits,
-           },
-         }
-       } catch {
-         return null
-       } finally {
-         clearTimeout(timeout)
-       }
-     }
+            // Check for API error response (but "success" is not an error)
+            if (data.base_resp?.status_msg && data.base_resp.status_msg !== "success") {
+              return { _error: `MiniMax API error: ${data.base_resp.status_msg}` }
+            }
 
-     export async function fetchOpenRouterUsage(): Promise<{
-       isFree?: boolean
-       usage?: number
-       usageDaily?: number
-       usageWeekly?: number
-       usageMonthly?: number
-       limit?: number | null
-       limitRemaining?: number | null
-     } | null> {
-       // Read OpenRouter API key from environment
-       const apiKey = process.env.OPENROUTER_API_KEY
-       if (!apiKey) return null
+            if (!data.model_remains || data.model_remains.length === 0) {
+              return { _error: "No quota data returned from MiniMax API" }
+            }
+
+            const modelRemain = data.model_remains[0]
+            const totalCredits = modelRemain.current_interval_total_count
+            const remainingCredits = modelRemain.current_interval_usage_count
+            const usedCredits = totalCredits - remainingCredits
+            const utilization = Math.round((usedCredits / totalCredits) * 100)
+
+            const result = {
+              fiveHour: {
+                utilization,
+                resetsAt: new Date(modelRemain.end_time).toISOString(),
+                remainingCredits,
+                totalCredits,
+              },
+            }
+
+            // Cache successful response
+            minimaxCache = { data: result, timestamp: Date.now() }
+
+            return result
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            // Continue to next domain if this one failed
+            if (domain === domains[domains.length - 1]) {
+              return { _error: `MiniMax API failed: ${errMsg}` }
+            }
+            continue
+          } finally {
+            clearTimeout(timeout)
+          }
+        }
+
+        return { _error: "Failed to reach MiniMax API" }
+      }
+
+      export async function fetchOpenRouterUsage(): Promise<{
+        isFree?: boolean
+        usage?: number
+        usageDaily?: number
+        usageWeekly?: number
+        usageMonthly?: number
+        limit?: number | null
+        limitRemaining?: number | null
+      } | null> {
+        // Read OpenRouter API key from environment or auth store
+        let apiKey = process.env.OPENROUTER_API_KEY
+        if (!apiKey) {
+          const authInfo = await Auth.get("openrouter")
+          if (authInfo?.type === "api") {
+            apiKey = authInfo.key
+          }
+        }
+        if (!apiKey) return null
 
        const controller = new AbortController()
        const timeout = setTimeout(() => controller.abort(), 5000)
@@ -1144,4 +1297,44 @@ export namespace Auth {
         }
       }
     }
+
+  export async function usage() {
+    const all = await Auth.all()
+    const result: Record<string, any> = {}
+
+    for (const [providerID, info] of Object.entries(all)) {
+      if (info.type !== "oauth") continue
+      const accounts = await Auth.OAuthPool.getUsage(providerID)
+      const anthropicUsage = await Auth.OAuthPool.fetchAnthropicUsage(providerID)
+      result[providerID] = { accounts, anthropicUsage: anthropicUsage ?? undefined }
+    }
+
+    const codexUsage = await Auth.OAuthPool.fetchCodexUsage()
+    if (codexUsage) {
+      result.codex = {
+        accounts: await Auth.OAuthPool.getUsage("openai"),
+        codexUsage,
+      }
+    }
+
+    const minimaxUsage = await Auth.OAuthPool.fetchMiniMaxUsage()
+    if (minimaxUsage) {
+      result.minimax = { accounts: [], minimaxUsage }
+    }
+
+    const openrouterUsage = await Auth.OAuthPool.fetchOpenRouterUsage()
+    if (openrouterUsage) {
+      result.openrouter = { accounts: [], openrouterUsage }
+    }
+
+    const githubCopilotUsage = await Auth.OAuthPool.fetchGitHubCopilotUsage()
+    if (githubCopilotUsage) {
+      result["github-copilot"] = {
+        accounts: await Auth.OAuthPool.getUsage("github-copilot"),
+        githubCopilotUsage,
+      }
+    }
+
+    return result
   }
+}

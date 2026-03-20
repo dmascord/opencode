@@ -9,6 +9,52 @@ const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 30_000
 const DEFAULT_AUTH_FAILURE_COOLDOWN_MS = 5 * 60_000
 const DEFAULT_NETWORK_RETRY_ATTEMPTS = 1
 
+function summarizeRecord(record: {
+  id: string
+  label?: string
+  accountId?: string
+  health: {
+    lastStatusCode?: number
+    cooldownUntil?: number
+    successCount: number
+    failureCount: number
+  }
+}) {
+  return {
+    id: record.id,
+    label: record.label,
+    accountId: record.accountId,
+    lastStatusCode: record.health.lastStatusCode,
+    cooldownUntil: record.health.cooldownUntil,
+    successCount: record.health.successCount,
+    failureCount: record.health.failureCount,
+  }
+}
+
+function summarizeResponseHeaders(response: Response) {
+  const keys = [
+    "retry-after",
+    "x-request-id",
+    "x-oai-request-id",
+    "x-codex-plan-type",
+    "x-codex-active-limit",
+    "x-codex-primary-used-percent",
+    "x-codex-primary-reset-at",
+    "x-codex-primary-reset-after-seconds",
+    "x-codex-secondary-used-percent",
+    "x-codex-secondary-reset-at",
+    "x-codex-secondary-reset-after-seconds",
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+  ]
+  const summary: Record<string, string> = {}
+  for (const key of keys) {
+    const value = response.headers.get(key) ?? response.headers.get(key.toUpperCase())
+    if (value) summary[key] = value
+  }
+  return summary
+}
+
 function isReadableStream(value: unknown): value is ReadableStream {
   return typeof ReadableStream !== "undefined" && value instanceof ReadableStream
 }
@@ -222,6 +268,17 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
       maxAttempts = candidates.length
     }
 
+    log.info("oauth rotation snapshot", {
+      providerID: opts.providerID,
+      namespace,
+      activeID,
+      orderedIDs,
+      candidates,
+      maxAttempts,
+      allowRetry,
+      records: records.map(summarizeRecord),
+    })
+
     const attempted = new Set<string>()
     const refreshed = new Set<string>()
     let lastError: unknown
@@ -240,6 +297,14 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
 
       if (!nextID) break
       attempted.add(nextID)
+      log.info("oauth rotation selected candidate", {
+        providerID: opts.providerID,
+        namespace,
+        attempt: attempt + 1,
+        maxAttempts,
+        record: summarizeRecord(recordByID.get(nextID)!),
+        attemptedIDs: Array.from(attempted),
+      })
 
       const hasMoreAttempts = () => attempt + 1 < maxAttempts
       let networkRetryAttempts = allowRetry ? configuredNetworkRetryAttempts : 0
@@ -291,6 +356,14 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
               statusCode: 0,
               ok: false,
             })
+            log.warn("oauth rotation request threw before response", {
+              providerID: opts.providerID,
+              namespace,
+              record: summarizeRecord(recordByID.get(nextID)!),
+              networkAttempt: networkAttempt + 1,
+              networkRetryAttempts,
+              error: errorMessage,
+            })
             const networkError = isNetworkError(e)
             if (networkError && allowRetry && networkAttempt < networkRetryAttempts) {
               continue
@@ -315,6 +388,13 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
       try {
         response = await runWithNetworkRetry()
       } catch (e) {
+        log.warn("oauth rotation candidate failed", {
+          providerID: opts.providerID,
+          namespace,
+          record: summarizeRecord(recordByID.get(nextID)!),
+          error: e instanceof Error ? e.message : String(e),
+          hasMoreAttempts: hasMoreAttempts(),
+        })
         if (isNetworkError(e)) throw e
 
         await Auth.OAuthPool.moveToBack(opts.providerID, namespace, nextID)
@@ -330,11 +410,25 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
           statusCode: response.status,
           ok: true,
         })
+        log.info("oauth rotation candidate succeeded", {
+          providerID: opts.providerID,
+          namespace,
+          record: summarizeRecord(recordByID.get(nextID)!),
+          statusCode: response.status,
+        })
         return response
       }
 
       if (response.status === 429) {
         const cooldownMs = parseRetryAfterMs(response) ?? rateLimitCooldownMs
+        log.warn("oauth rotation rate limited", {
+          providerID: opts.providerID,
+          namespace,
+          record: summarizeRecord(recordByID.get(nextID)!),
+          statusCode: response.status,
+          cooldownMs,
+          headers: summarizeResponseHeaders(response),
+        })
         await Auth.OAuthPool.recordOutcome({
           providerID: opts.providerID,
           recordID: nextID,
@@ -351,6 +445,13 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
 
       if (isAuthExpiredStatus(response.status) && !refreshed.has(nextID)) {
         refreshed.add(nextID)
+        log.warn("oauth rotation auth expired", {
+          providerID: opts.providerID,
+          namespace,
+          record: summarizeRecord(recordByID.get(nextID)!),
+          statusCode: response.status,
+          headers: summarizeResponseHeaders(response),
+        })
 
         await Auth.OAuthPool.markAccessExpired(opts.providerID, namespace, nextID)
         if (!allowRetry) {
@@ -378,11 +479,25 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
               statusCode: retry.status,
               ok: true,
             })
+            log.info("oauth rotation retry after auth refresh succeeded", {
+              providerID: opts.providerID,
+              namespace,
+              record: summarizeRecord(recordByID.get(nextID)!),
+              statusCode: retry.status,
+            })
             return retry
           }
 
           if (retry.status === 429) {
             const cooldownMs = parseRetryAfterMs(retry) ?? rateLimitCooldownMs
+            log.warn("oauth rotation retry hit rate limit", {
+              providerID: opts.providerID,
+              namespace,
+              record: summarizeRecord(recordByID.get(nextID)!),
+              statusCode: retry.status,
+              cooldownMs,
+              headers: summarizeResponseHeaders(retry),
+            })
             await Auth.OAuthPool.recordOutcome({
               providerID: opts.providerID,
               recordID: nextID,
@@ -398,6 +513,14 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
           }
 
           const cooldownUntil = Date.now() + authFailureCooldownMs
+          log.warn("oauth rotation retry still unauthorized", {
+            providerID: opts.providerID,
+            namespace,
+            record: summarizeRecord(recordByID.get(nextID)!),
+            statusCode: retry.status,
+            cooldownUntil,
+            headers: summarizeResponseHeaders(retry),
+          })
           await Auth.OAuthPool.recordOutcome({
             providerID: opts.providerID,
             recordID: nextID,
@@ -425,6 +548,13 @@ export function createOAuthRotatingFetch<TFetch extends (input: any, init?: any)
         recordID: nextID,
         statusCode: response.status,
         ok: false,
+      })
+      log.warn("oauth rotation non-retryable response", {
+        providerID: opts.providerID,
+        namespace,
+        record: summarizeRecord(recordByID.get(nextID)!),
+        statusCode: response.status,
+        headers: summarizeResponseHeaders(response),
       })
       await Auth.OAuthPool.moveToBack(opts.providerID, namespace, nextID)
       await notifyFailover(response.status)

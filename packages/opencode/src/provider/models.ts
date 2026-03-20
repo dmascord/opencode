@@ -12,6 +12,15 @@ import { Filesystem } from "../util/filesystem"
 /* @ts-ignore */
 
 export namespace ModelsDev {
+  export const Runtime = z
+    .object({
+      system_prompt: z.enum(["anthropic", "beast", "codex", "gemini", "groq", "qwen", "trinity"]).optional(),
+      disable_local_tools: z.boolean().optional(),
+      max_active_tools: z.number().int().positive().optional(),
+      tool_priority: z.array(z.string()).optional(),
+    })
+    .optional()
+
   const log = Log.create({ service: "models.dev" })
   const filepath = path.join(Global.Path.cache, "models.json")
 
@@ -67,6 +76,7 @@ export namespace ModelsDev {
     headers: z.record(z.string(), z.string()).optional(),
     provider: z.object({ npm: z.string().optional(), api: z.string().optional() }).optional(),
     variants: z.record(z.string(), z.record(z.string(), z.any())).optional(),
+    runtime: Runtime,
   })
   export type Model = z.infer<typeof Model>
 

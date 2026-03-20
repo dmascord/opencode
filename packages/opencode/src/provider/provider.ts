@@ -43,9 +43,12 @@ import { createGitLab, VERSION as GITLAB_PROVIDER_VERSION } from "@gitlab/gitlab
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers"
 import { GoogleAuth } from "google-auth-library"
 import { ProviderTransform } from "./transform"
+import { MODEL_RUNTIME_POLICY, PROVIDER_RUNTIME_POLICY } from "./runtime-policy"
+import { PROVIDER_OVERRIDES } from "./overrides"
 
 export namespace Provider {
   const log = Log.create({ service: "provider" })
+  const DEFAULT_PROVIDER_TIMEOUT_MS = 60_000
 
   function isGpt5OrLater(modelID: string): boolean {
     const match = /^gpt-(\d+)/.exec(modelID)
@@ -646,6 +649,12 @@ export namespace Provider {
           }),
         ]),
       }),
+      runtime: z.object({
+        systemPrompt: z.enum(["anthropic", "beast", "codex", "gemini", "groq", "qwen", "trinity"]).optional(),
+        disableLocalTools: z.boolean().optional(),
+        maxActiveTools: z.number().int().positive().optional(),
+        toolPriority: z.array(z.string()).optional(),
+      }),
       cost: z.object({
         input: z.number(),
         output: z.number(),
@@ -694,6 +703,26 @@ export namespace Provider {
       ref: "Provider",
     })
   export type Info = z.infer<typeof Info>
+
+  function defaultRuntimePolicy(model: Pick<Model, "providerID" | "id" | "api">): Model["runtime"] {
+    return {
+      ...(PROVIDER_RUNTIME_POLICY[model.providerID as keyof typeof PROVIDER_RUNTIME_POLICY] ?? {}),
+      ...(MODEL_RUNTIME_POLICY[`${model.providerID}/${model.id}` as keyof typeof MODEL_RUNTIME_POLICY] ?? {}),
+      ...(MODEL_RUNTIME_POLICY[`${model.providerID}/${model.api.id}` as keyof typeof MODEL_RUNTIME_POLICY] ?? {}),
+    }
+  }
+
+  function runtimeOverrides(runtime?: ModelsDev.Model["runtime"]): Partial<Model["runtime"]> {
+    return pickBy(
+      {
+        systemPrompt: runtime?.system_prompt,
+        disableLocalTools: runtime?.disable_local_tools,
+        maxActiveTools: runtime?.max_active_tools,
+        toolPriority: runtime?.tool_priority,
+      },
+      (value) => value !== undefined,
+    )
+  }
 
   function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
     const m: Model = {
@@ -756,6 +785,10 @@ export namespace Provider {
         },
         interleaved: model.interleaved ?? false,
       },
+      runtime: {
+        ...defaultRuntimePolicy({ providerID: provider.id, id: model.id, api: { id: model.id } } as Pick<Model, "providerID" | "id" | "api">),
+        ...runtimeOverrides(model.runtime),
+      },
       release_date: model.release_date,
       variants: {},
     }
@@ -800,6 +833,7 @@ export namespace Provider {
 
     log.info("init")
 
+    const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES)
     const configProviders = Object.entries(config.provider ?? {})
 
     // Add GitHub Copilot Enterprise provider that inherits from GitHub Copilot
@@ -829,8 +863,8 @@ export namespace Provider {
       providers[providerID] = mergeDeep(match, provider)
     }
 
-    // extend database from config
-    for (const [providerID, provider] of configProviders) {
+    // extend database from bundled overrides, then user config
+    for (const [providerID, provider] of [...bundledOverrideProviders, ...configProviders]) {
       const existing = database[providerID]
       const parsed: Info = {
         id: providerID,
@@ -884,6 +918,11 @@ export namespace Provider {
             },
             interleaved: model.interleaved ?? false,
           },
+          runtime: {
+            ...defaultRuntimePolicy({ providerID, id: modelID, api: { id: model.id ?? existingModel?.api.id ?? modelID } } as Pick<Model, "providerID" | "id" | "api">),
+            ...existingModel?.runtime,
+            ...runtimeOverrides(model.runtime),
+          },
           cost: {
             input: model?.cost?.input ?? existingModel?.cost?.input ?? 0,
             output: model?.cost?.output ?? existingModel?.cost?.output ?? 0,
@@ -932,7 +971,12 @@ export namespace Provider {
           source: "api",
           key: provider.key,
         })
+        continue
       }
+
+      mergeProvider(providerID, {
+        source: "custom",
+      })
     }
 
     for (const plugin of await Plugin.list()) {
@@ -956,7 +1000,10 @@ export namespace Provider {
 
       // Load for the main provider if auth exists
       if (auth) {
-        const options = await plugin.auth.loader(() => Auth.get(providerID) as any, database[plugin.auth.provider])
+        const options = await plugin.auth.loader(
+          () => Auth.get(providerID) as any,
+          providers[plugin.auth.provider] ?? database[plugin.auth.provider],
+        )
         const opts = options ?? {}
         const patch: Partial<Info> = providers[plugin.auth.provider]
           ? { options: opts }
@@ -972,7 +1019,7 @@ export namespace Provider {
           if (enterpriseAuth) {
             const enterpriseOptions = await plugin.auth.loader(
               () => Auth.get(enterpriseProviderID) as any,
-              database[enterpriseProviderID],
+              providers[enterpriseProviderID] ?? database[enterpriseProviderID],
             )
             const opts = enterpriseOptions ?? {}
             const patch: Partial<Info> = providers[enterpriseProviderID]
@@ -1092,6 +1139,7 @@ export namespace Provider {
       if (existing) return existing
 
       const customFetch = options["fetch"]
+      if (options["timeout"] === undefined) options["timeout"] = DEFAULT_PROVIDER_TIMEOUT_MS
 
       const fetchWithTimeout = async (input: any, init?: BunFetchRequestInit) => {
         // Preserve custom fetch if it exists, wrap it with timeout logic
@@ -1183,7 +1231,7 @@ export namespace Provider {
     return state().then((s) => s.providers[providerID])
   }
 
-  export async function getModel(providerID: string, modelID: string) {
+  export async function getModel(providerID: string, modelID: string, originalModel?: string) {
     const s = await state()
     const provider = s.providers[providerID]
     if (!provider) {
@@ -1193,13 +1241,41 @@ export namespace Provider {
       throw new ModelNotFoundError({ providerID, modelID, suggestions })
     }
 
-    const info = provider.models[modelID]
+    // First try to find the model by the short ID (e.g., "compound")
+    let info = provider.models[modelID]
+    let foundByFullID = false
+
+    // If not found, try the full ID (e.g., "groq/compound") - needed for providers like Groq
+    // where the API requires the full model ID including the provider prefix
+    if (!info) {
+      const fullModelID = `${providerID}/${modelID}`
+      info = provider.models[fullModelID]
+      if (info) {
+        foundByFullID = true
+      }
+    }
+
     if (!info) {
       const availableModels = Object.keys(provider.models)
       const matches = fuzzysort.go(modelID, availableModels, { limit: 3, threshold: -10000 })
       const suggestions = matches.map((m) => m.target)
       throw new ModelNotFoundError({ providerID, modelID, suggestions })
     }
+
+    // If the model was found by its full ID (e.g., "groq/compound" in config),
+    // we need to update the api.id to use the full model ID for providers like Groq
+    // that require the full prefix in API calls
+    if (foundByFullID) {
+      const fullModelID = `${providerID}/${modelID}`
+      info = {
+        ...info,
+        api: {
+          ...info.api,
+          id: fullModelID,
+        },
+      }
+    }
+
     return info
   }
 
@@ -1353,6 +1429,7 @@ export namespace Provider {
     return {
       providerID: providerID,
       modelID: rest.join("/"),
+      original: model,
     }
   }
 

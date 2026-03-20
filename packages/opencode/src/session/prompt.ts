@@ -1808,7 +1808,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     })()
 
     try {
-      await Provider.getModel(taskModel.providerID, taskModel.modelID)
+      await Provider.getModel(
+        taskModel.providerID,
+        taskModel.modelID,
+        "original" in taskModel && typeof taskModel.original === "string" ? taskModel.original : undefined,
+      )
     } catch (e) {
       if (Provider.ModelNotFoundError.isInstance(e)) {
         const { providerID, modelID, suggestions } = e.data

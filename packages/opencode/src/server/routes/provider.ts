@@ -183,42 +183,7 @@ export const ProviderRoutes = lazy(() =>
         },
       }),
        async (c) => {
-         const all = await Auth.all()
-         const result: Record<string, any> = {}
-
-        for (const [providerID, info] of Object.entries(all)) {
-          if (info.type === "oauth") {
-            const accounts = await Auth.OAuthPool.getUsage(providerID)
-            const anthropicUsage = await Auth.OAuthPool.fetchAnthropicUsage(providerID)
-            result[providerID] = { accounts, anthropicUsage: anthropicUsage ?? undefined }
-          }
-        }
-
-         // Add Codex usage (OAuth-based)
-         const codexUsage = await Auth.OAuthPool.fetchCodexUsage()
-         if (codexUsage) {
-           result["codex"] = { accounts: [], codexUsage }
-         }
-
-         // Add MiniMax usage (API key-based)
-         const minimaxUsage = await Auth.OAuthPool.fetchMiniMaxUsage()
-         if (minimaxUsage) {
-           result["minimax"] = { accounts: [], minimaxUsage }
-         }
-
-          // Add OpenRouter usage (API key-based)
-          const openrouterUsage = await Auth.OAuthPool.fetchOpenRouterUsage()
-          if (openrouterUsage) {
-            result["openrouter"] = { accounts: [], openrouterUsage }
-          }
-
-          // Add GitHub Copilot usage (OAuth-based)
-          const githubCopilotUsage = await Auth.OAuthPool.fetchGitHubCopilotUsage()
-          if (githubCopilotUsage) {
-            result["github-copilot"] = { accounts: [], githubCopilotUsage }
-          }
-
-          return c.json(result)
+          return c.json(await Auth.usage())
       },
     )
     .post(

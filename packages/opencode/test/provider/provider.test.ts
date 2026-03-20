@@ -2,6 +2,7 @@ import { test, expect } from "bun:test"
 import path from "path"
 
 import { tmpdir } from "../fixture/fixture"
+import { Auth } from "../../src/auth"
 import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider/provider"
 import { Env } from "../../src/env"
@@ -56,6 +57,36 @@ test("provider loaded from config with apiKey option", async () => {
     fn: async () => {
       const providers = await Provider.list()
       expect(providers["anthropic"]).toBeDefined()
+    },
+  })
+})
+
+test("provider loaded from oauth auth store", async () => {
+  await using tmp = await tmpdir({
+    init: async (dir) => {
+      await Bun.write(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+        }),
+      )
+    },
+  })
+
+  await Auth.set("anthropic", {
+    type: "oauth",
+    access: "test-access-token",
+    refresh: "test-refresh-token",
+    expires: Date.now() + 3600000,
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const providers = await Provider.list()
+      expect(providers["anthropic"]).toBeDefined()
+      expect(providers["anthropic"].source).toBe("custom")
+      expect(providers["anthropic"].options.headers["anthropic-beta"]).toBeDefined()
     },
   })
 })

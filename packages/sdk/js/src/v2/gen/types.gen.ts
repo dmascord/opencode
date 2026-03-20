@@ -646,15 +646,45 @@ export type EventPermissionReplied = {
 export type SessionStatus =
   | {
       type: "idle"
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
   | {
       type: "retry"
       attempt: number
       message: string
       next: number
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
   | {
       type: "busy"
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
 
 export type EventSessionStatus = {
@@ -1218,6 +1248,12 @@ export type ProviderConfig = {
           [key: string]: unknown | boolean | undefined
         }
       }
+      runtime?: {
+        system_prompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+        disable_local_tools?: boolean
+        max_active_tools?: number
+        tool_priority?: Array<string>
+      }
     }
   }
   whitelist?: Array<string>
@@ -1607,6 +1643,12 @@ export type Model = {
       | {
           field: "reasoning_content" | "reasoning_details"
         }
+  }
+  runtime: {
+    systemPrompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+    disableLocalTools?: boolean
+    maxActiveTools?: number
+    toolPriority?: Array<string>
   }
   cost: {
     input: number
@@ -4038,6 +4080,12 @@ export type ProviderListResponses = {
               [key: string]: unknown
             }
           }
+          runtime?: {
+            system_prompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+            disable_local_tools?: boolean
+            max_active_tools?: number
+            tool_priority?: Array<string>
+          }
         }
       }
     }>
@@ -4156,6 +4204,7 @@ export type AuthUsageData = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/usage"
 }
@@ -4187,6 +4236,7 @@ export type AuthSetActiveData = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/active"
 }
@@ -4220,6 +4270,7 @@ export type AuthDeleteAccountData = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/account"
 }
@@ -4255,6 +4306,7 @@ export type AuthUpdateAccountData = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/account"
 }
@@ -4284,6 +4336,7 @@ export type ProviderBrowserSessionsData = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/browser-session"
 }
@@ -4315,6 +4368,7 @@ export type ProviderBrowserSessionRemoveData = {
   }
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/browser-session/{recordId}"
 }
@@ -4349,6 +4403,7 @@ export type ProviderBrowserSessionStatusData = {
   }
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/browser-session/{recordId}"
 }
@@ -4390,6 +4445,7 @@ export type ProviderBrowserSessionSetupData = {
   }
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/browser-session/{recordId}/setup"
 }
@@ -4427,6 +4483,7 @@ export type ProviderBrowserSessionRefreshData = {
   }
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/provider/auth/browser-session/{recordId}/refresh"
 }
@@ -5144,6 +5201,7 @@ export type AuthUsage2Data = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/auth/usage"
 }
@@ -5175,6 +5233,7 @@ export type AuthSetActive2Data = {
   path?: never
   query?: {
     directory?: string
+    workspace?: string
   }
   url: "/auth/active"
 }

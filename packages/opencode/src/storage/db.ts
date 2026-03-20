@@ -31,7 +31,7 @@ export namespace Database {
 
   type Client = SQLiteBunDatabase<Schema>
 
-  type Journal = { sql: string; timestamp: number }[]
+  type Journal = { sql: string; timestamp: number; name: string }[]
 
   const state = {
     sqlite: undefined as BunDatabase | undefined,
@@ -62,6 +62,7 @@ export namespace Database {
         return {
           sql: readFileSync(file, "utf-8"),
           timestamp: time(name),
+          name: name,
         }
       })
       .filter(Boolean) as Journal

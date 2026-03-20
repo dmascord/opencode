@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import path from "path"
-import type { ModelMessage } from "ai"
+import { jsonSchema, tool, type ModelMessage } from "ai"
 import { LLM } from "../../src/session/llm"
 import { Global } from "../../src/global"
 import { Instance } from "../../src/project/instance"
@@ -661,6 +661,119 @@ describe("session.llm.stream", () => {
         expect(config?.temperature).toBe(0.3)
         expect(config?.topP).toBe(0.8)
         expect(config?.maxOutputTokens).toBe(ProviderTransform.maxOutputTokens(resolved))
+      },
+    })
+  })
+
+  test("uses prompt-based tool calling fallback for groq compound", async () => {
+    const server = state.server
+    if (!server) {
+      throw new Error("Server not initialized")
+    }
+
+    const request = waitRequest(
+      "/chat/completions",
+      new Response(createChatStream('<tool_call>{"name":"ping","arguments":{"value":"hello"}}</tool_call>'), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    )
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: ["groq"],
+            provider: {
+              groq: {
+                options: {
+                  apiKey: "test-groq-key",
+                  baseURL: `${server.url.origin}/v1`,
+                },
+                models: {
+                  compound: {
+                    id: "compound",
+                    name: "Groq Compound",
+                    tool_call: false,
+                    temperature: true,
+                    reasoning: false,
+                    attachment: false,
+                    release_date: "2026-01-01",
+                    modalities: { input: ["text"], output: ["text"] },
+                    limit: { context: 200000, output: 8192 },
+                  },
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel("groq", "compound")
+        const sessionID = "session-test-groq-compound"
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const user = {
+          id: "user-groq-1",
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: "groq", modelID: resolved.id },
+        } satisfies MessageV2.User
+
+        const stream = await LLM.stream({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          abort: new AbortController().signal,
+          messages: [{ role: "user", content: "Call ping." }],
+          tools: {
+            ping: tool({
+              description: "Ping test tool",
+              inputSchema: jsonSchema({
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+              }),
+              execute: async (input) => ({
+                output: `pong:${String((input as { value?: string }).value ?? "")}`,
+                title: "Ping",
+                metadata: {},
+              }),
+            }),
+          },
+        })
+
+        const parts: string[] = []
+        const errors: string[] = []
+        for await (const part of stream.fullStream) {
+          parts.push(part.type)
+          if (part.type === "error") {
+            errors.push(part.error.message)
+          }
+        }
+
+        const capture = await request
+        const body = capture.body
+        expect(body.tools).toBeUndefined()
+        expect(body.tool_choice).toBeUndefined()
+        expect(body.messages.length).toBeGreaterThan(0)
+        expect(parts).toContain("error")
+        expect(errors.length).toBeGreaterThan(0)
       },
     })
   })

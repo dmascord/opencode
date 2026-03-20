@@ -1,22 +1,39 @@
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
+import { Auth } from "@/auth"
 import { Instance } from "@/project/instance"
 import z from "zod"
 
 export namespace SessionStatus {
+  export const Quota = z
+    .object({
+      account: z.string().optional(),
+      cooldownUntil: z.number().optional(),
+      lastStatusCode: z.number().optional(),
+      lastErrorAt: z.number().optional(),
+      successCount: z.number().optional(),
+      failureCount: z.number().optional(),
+    })
+    .strict()
+
+  export const Provider = z.record(z.string(), Quota)
+
   export const Info = z
     .union([
       z.object({
         type: z.literal("idle"),
+        provider: Provider.optional(),
       }),
       z.object({
         type: z.literal("retry"),
         attempt: z.number(),
         message: z.string(),
         next: z.number(),
+        provider: Provider.optional(),
       }),
       z.object({
         type: z.literal("busy"),
+        provider: Provider.optional(),
       }),
     ])
     .meta({
@@ -58,10 +75,45 @@ export namespace SessionStatus {
     return state()
   }
 
+  export async function global(): Promise<Info> {
+    const auth = await Auth.all()
+    const provider = Object.fromEntries(
+      await Promise.all(
+        Object.entries(auth)
+          .filter(([, info]) => info.type === "oauth")
+          .map(async ([id]) => {
+            const pool = await Auth.OAuthPool.snapshot(id)
+            const rid = pool.orderedIDs[0]
+            const rec = rid ? pool.records.find((item) => item.id === rid) : undefined
+            if (!rec) return []
+            return [
+              id,
+              {
+                account: rec.accountId ?? rec.label ?? rec.id,
+                cooldownUntil: rec.health.cooldownUntil,
+                lastStatusCode: rec.health.lastStatusCode,
+                lastErrorAt: rec.health.lastErrorAt,
+                successCount: rec.health.successCount,
+                failureCount: rec.health.failureCount,
+              },
+            ]
+          }),
+      ),
+    )
+    if (!Object.keys(provider).length) return { type: "idle" }
+    return { type: "idle", provider }
+  }
+
   export function set(sessionID: string, status: Info) {
     Bus.publish(Event.Status, {
       sessionID,
       status,
+    })
+    void global().then((status) => {
+      Bus.publish(Event.Status, {
+        sessionID: "__global__",
+        status,
+      })
     })
     if (status.type === "idle") {
       // deprecated

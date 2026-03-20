@@ -1,6 +1,19 @@
 import { Installation } from "@/installation"
 import { Provider } from "@/provider/provider"
 import { Log } from "@/util/log"
+import type {
+  LanguageModelV2CallWarning,
+  LanguageModelV2CallOptions,
+  LanguageModelV2Content,
+  LanguageModelV2FinishReason,
+  LanguageModelV2FunctionTool,
+  LanguageModelV2Prompt,
+  LanguageModelV2StreamPart,
+  LanguageModelV2ToolChoice,
+  LanguageModelV2ToolResultOutput,
+  LanguageModelV2Usage,
+  SharedV2ProviderMetadata,
+} from "@ai-sdk/provider"
 import {
   streamText,
   wrapLanguageModel,
@@ -26,28 +39,8 @@ import { Auth } from "@/auth"
 export namespace LLM {
   const log = Log.create({ service: "llm" })
   export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
-  const APIM_MAX_ACTIVE_TOOLS = 128
-  const APIM_CORE_TOOL_ORDER = [
-    "task",
-    "bash",
-    "read",
-    "glob",
-    "grep",
-    "apply_patch",
-    "edit",
-    "write",
-    "webfetch",
-    "todoread",
-    "todowrite",
-    "question",
-    "skill",
-    "websearch",
-    "codesearch",
-    "batch",
-    "lsp",
-    "planexit",
-  ]
-  const APIM_CORE_TOOL_PRIORITY = new Map(APIM_CORE_TOOL_ORDER.map((name, index) => [name, index]))
+  const PROMPT_TOOL_CALL_OPEN = "<tool_call>"
+  const PROMPT_TOOL_CALL_CLOSE = "</tool_call>"
 
   export type StreamInput = {
     user: MessageV2.User
@@ -170,6 +163,20 @@ export namespace LLM {
       isCodex || provider.id.includes("github-copilot") ? undefined : ProviderTransform.maxOutputTokens(input.model)
 
     let tools = await resolveTools(input)
+    let toolChoice = input.toolChoice
+
+    if (disablesToolsForModel(input.model)) {
+      if (Object.keys(tools).length > 0 || toolChoice) {
+        l.warn("disabling tools for unsupported model", {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          apiModelID: input.model.api.id,
+          toolCount: Object.keys(tools).length,
+        })
+      }
+      tools = {}
+      toolChoice = undefined
+    }
 
     // LiteLLM and some Anthropic proxies require the tools parameter to be present
     // when message history contains tool calls, even if no tools are being used.
@@ -191,13 +198,15 @@ export namespace LLM {
       })
     }
 
-    if (input.model.providerID === "apim") {
+    const runtimeToolLimit = input.model.runtime.maxActiveTools
+    if (runtimeToolLimit) {
       const invalidEntry = Object.entries(tools).find(([name]) => name === "invalid")
       const activeEntries = Object.entries(tools).filter(([name]) => name !== "invalid")
       const referencedTools = referencedToolNames(input.messages)
       const requiredTools = requiredToolNames(input.toolChoice)
+      const toolPriority = new Map((input.model.runtime.toolPriority ?? []).map((name, index) => [name, index]))
 
-      if (activeEntries.length > APIM_MAX_ACTIVE_TOOLS) {
+      if (activeEntries.length > runtimeToolLimit) {
         const ranked = activeEntries
           .map(([name, value], index) => ({
             name,
@@ -205,7 +214,7 @@ export namespace LLM {
             index,
             referenced: referencedTools.has(name),
             required: requiredTools.has(name),
-            corePriority: APIM_CORE_TOOL_PRIORITY.get(name) ?? Number.POSITIVE_INFINITY,
+            corePriority: toolPriority.get(name) ?? Number.POSITIVE_INFINITY,
           }))
           .sort((a, b) => {
             if (a.required !== b.required) return a.required ? -1 : 1
@@ -214,18 +223,19 @@ export namespace LLM {
             return a.index - b.index
           })
         const kept = ranked
-          .slice(0, APIM_MAX_ACTIVE_TOOLS)
+          .slice(0, runtimeToolLimit)
           .sort((a, b) => a.index - b.index)
-        const dropped = ranked.slice(APIM_MAX_ACTIVE_TOOLS).map((item) => item.name)
+        const dropped = ranked.slice(runtimeToolLimit).map((item) => item.name)
         tools = Object.fromEntries(kept.map((item) => [item.name, item.value]))
         if (invalidEntry) tools.invalid = invalidEntry[1]
-        l.warn("capping apim tools to provider limit", {
-          limit: APIM_MAX_ACTIVE_TOOLS,
+        l.warn("capping active tools to model runtime limit", {
+          limit: runtimeToolLimit,
           kept: kept.length,
           dropped: activeEntries.length - kept.length,
           requiredKept: kept.filter((item) => item.required).map((item) => item.name),
           referencedKept: kept.filter((item) => item.referenced).map((item) => item.name),
           droppedTools: dropped.slice(0, 10),
+          toolPriority: input.model.runtime.toolPriority,
         })
       }
     }
@@ -263,7 +273,7 @@ export namespace LLM {
       providerOptions: ProviderTransform.providerOptions(input.model, params.options),
       activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
       tools,
-      toolChoice: input.toolChoice,
+      toolChoice,
       maxOutputTokens,
       abortSignal: input.abort,
       headers: {
@@ -297,11 +307,150 @@ export namespace LLM {
         middleware: [
           {
             async transformParams(args) {
-              if (args.type === "stream") {
-                // @ts-expect-error
-                args.params.prompt = ProviderTransform.message(args.params.prompt, input.model, options)
+              // @ts-expect-error
+              args.params.prompt = ProviderTransform.message(args.params.prompt, input.model, options)
+              if (usesPromptToolCalling(input.model, args.params)) {
+                l.info("activating prompt-based tool fallback", {
+                  providerID: input.model.providerID,
+                  modelID: input.model.id,
+                  apiModelID: input.model.api.id,
+                  toolCount: Array.isArray(args.params.tools) ? args.params.tools.length : 0,
+                })
+                args.params = transformParamsForPromptToolCalling(args.params)
               }
               return args.params
+            },
+            async wrapGenerate({ doGenerate, params }) {
+              const result = await doGenerate()
+              if (!getPromptToolCallingState(params)) return result
+              l.info("rewriting prompt-based tool response", {
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                mode: "generate",
+              })
+              return rewriteGenerateResultForPromptToolCalling(result, params)
+            },
+            async wrapStream({ doGenerate, doStream, params }) {
+              if (!getPromptToolCallingState(params)) return doStream()
+              l.info("rewriting prompt-based tool response", {
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                mode: "stream",
+              })
+
+              const result = await doStream()
+              return {
+                request: result.request,
+                response: result.response,
+                stream: new ReadableStream<LanguageModelV2StreamPart>({
+                  async start(controller) {
+                    const orderedParts: Array<{ type: "text" | "reasoning"; id: string; text: string }> = []
+                    const warnings: LanguageModelV2CallWarning[] = []
+                    let finishReason: LanguageModelV2FinishReason = "unknown"
+                    let usage: LanguageModelV2Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+                    let providerMetadata: SharedV2ProviderMetadata | undefined
+
+                    for await (const part of result.stream as any) {
+                      if (part.type === "stream-start") {
+                        warnings.push(...part.warnings)
+                        continue
+                      }
+                      if (part.type === "text-start") {
+                        orderedParts.push({ type: "text", id: part.id, text: "" })
+                        continue
+                      }
+                      if (part.type === "text-delta") {
+                        let match = orderedParts.find((item) => item.type === "text" && item.id === part.id)
+                        if (!match) {
+                          match = { type: "text", id: part.id, text: "" }
+                          orderedParts.push(match)
+                        }
+                        match.text += part.delta
+                        continue
+                      }
+                      if (part.type === "reasoning-start") {
+                        orderedParts.push({ type: "reasoning", id: part.id, text: "" })
+                        continue
+                      }
+                      if (part.type === "reasoning-delta") {
+                        let match = orderedParts.find((item) => item.type === "reasoning" && item.id === part.id)
+                        if (!match) {
+                          match = { type: "reasoning", id: part.id, text: "" }
+                          orderedParts.push(match)
+                        }
+                        match.text += part.delta
+                        continue
+                      }
+                      if (part.type === "finish") {
+                        finishReason = part.finishReason
+                        usage = part.usage
+                        providerMetadata = part.providerMetadata as SharedV2ProviderMetadata | undefined
+                      }
+                    }
+
+                    const rewritten = rewriteGenerateResultForPromptToolCalling(
+                      {
+                        content: orderedParts.map((part) =>
+                          part.type === "text" ? { type: "text", text: part.text } : { type: "reasoning", text: part.text },
+                        ),
+                        finishReason,
+                        usage,
+                        warnings,
+                        providerMetadata,
+                      },
+                      params,
+                    )
+
+                    controller.enqueue({
+                      type: "stream-start",
+                      warnings: rewritten.warnings,
+                    })
+
+                    for (const part of rewritten.content) {
+                      if (part.type === "text") {
+                        const id = `text-${crypto.randomUUID()}`
+                        controller.enqueue({ type: "text-start", id })
+                        controller.enqueue({ type: "text-delta", id, delta: part.text })
+                        controller.enqueue({ type: "text-end", id })
+                        continue
+                      }
+
+                      if (part.type === "reasoning") {
+                        const id = `reasoning-${crypto.randomUUID()}`
+                        controller.enqueue({ type: "reasoning-start", id })
+                        controller.enqueue({ type: "reasoning-delta", id, delta: part.text })
+                        controller.enqueue({ type: "reasoning-end", id })
+                        continue
+                      }
+
+                      if (part.type === "tool-call") {
+                        const rawInput = JSON.stringify(part.input)
+                        controller.enqueue({
+                          type: "tool-input-start",
+                          id: part.toolCallId,
+                          toolName: part.toolName,
+                          providerExecuted: false,
+                        })
+                        controller.enqueue({
+                          type: "tool-input-delta",
+                          id: part.toolCallId,
+                          delta: rawInput,
+                        })
+                        controller.enqueue({ type: "tool-input-end", id: part.toolCallId })
+                        controller.enqueue(part)
+                      }
+                    }
+
+                    controller.enqueue({
+                      type: "finish",
+                      finishReason: rewritten.finishReason,
+                      usage: rewritten.usage,
+                      providerMetadata: rewritten.providerMetadata,
+                    })
+                    controller.close()
+                  },
+                }),
+              }
             },
           },
         ],
@@ -336,6 +485,297 @@ export namespace LLM {
       }
     }
     return false
+  }
+
+  function disablesToolsForModel(model: Provider.Model) {
+    return model.runtime.disableLocalTools === true || model.capabilities.toolcall === false
+  }
+
+  function usesPromptToolCalling(model: Provider.Model, params: Pick<LanguageModelV2CallOptions, "tools">) {
+    return disablesToolsForModel(model) && Array.isArray(params.tools) && params.tools.some((tool) => tool.type === "function")
+  }
+
+  function transformParamsForPromptToolCalling(params: LanguageModelV2CallOptions): LanguageModelV2CallOptions {
+    const functionTools = (params.tools ?? []).filter(
+      (tool): tool is LanguageModelV2FunctionTool => tool.type === "function",
+    )
+    if (functionTools.length === 0) return params
+
+    const prompt = rewritePromptForPromptToolCalling(params.prompt, functionTools, params.toolChoice)
+    return {
+      ...params,
+      prompt,
+      tools: undefined,
+      toolChoice: undefined,
+      providerOptions: {
+        ...params.providerOptions,
+        opencode: {
+          ...(params.providerOptions?.opencode ?? {}),
+          promptToolCalling: JSON.stringify({
+            tools: functionTools.map((tool) => ({
+              type: tool.type,
+              name: tool.name,
+              description: tool.description ?? null,
+              inputSchema: tool.inputSchema,
+            })),
+            toolChoice: params.toolChoice ?? null,
+          }),
+        },
+      },
+    }
+  }
+
+  function getPromptToolCallingState(params: Pick<LanguageModelV2CallOptions, "providerOptions">) {
+    const value = params.providerOptions?.opencode?.promptToolCalling
+    if (typeof value !== "string") return undefined
+    let parsed: { tools?: unknown }
+    try {
+      parsed = JSON.parse(value) as { tools?: unknown }
+    } catch {
+      return undefined
+    }
+    const tools = parsed.tools
+    if (!Array.isArray(tools)) return undefined
+    return {
+      tools: tools.filter(
+        (tool): tool is LanguageModelV2FunctionTool =>
+          !!tool &&
+          typeof tool === "object" &&
+          (tool as { type?: unknown }).type === "function" &&
+          typeof (tool as { name?: unknown }).name === "string",
+      ),
+    }
+  }
+
+  function rewritePromptForPromptToolCalling(
+    prompt: LanguageModelV2Prompt,
+    tools: LanguageModelV2FunctionTool[],
+    toolChoice?: LanguageModelV2ToolChoice,
+  ): LanguageModelV2Prompt {
+    const instruction = buildPromptToolCallingInstruction(tools, toolChoice)
+    const result: LanguageModelV2Prompt = []
+    let injected = false
+
+    for (const message of prompt) {
+      if (message.role === "system") {
+        result.push({
+          ...message,
+          content: injected ? message.content : `${message.content}\n\n${instruction}`,
+        })
+        injected = true
+        continue
+      }
+
+      if (message.role === "assistant") {
+        const content = assistantContentToText(message.content)
+        if (content) {
+          result.push({
+            ...message,
+            content: [{ type: "text", text: content }],
+          })
+        }
+        continue
+      }
+
+      if (message.role === "tool") {
+        const content = toolResultsToText(message.content)
+        if (content) {
+          result.push({
+            role: "user",
+            content: [{ type: "text", text: content }],
+          })
+        }
+        continue
+      }
+
+      result.push(message)
+    }
+
+    if (!injected) {
+      result.unshift({
+        role: "system",
+        content: instruction,
+      })
+    }
+
+    return result
+  }
+
+  function buildPromptToolCallingInstruction(
+    tools: LanguageModelV2FunctionTool[],
+    toolChoice?: LanguageModelV2ToolChoice,
+  ) {
+    const toolList = tools
+      .map((tool) => {
+        const schema = JSON.stringify(tool.inputSchema)
+        return `- ${tool.name}: ${tool.description ?? "No description"}\n  schema: ${schema}`
+      })
+      .join("\n")
+
+    const choiceInstruction = (() => {
+      if (!toolChoice || toolChoice.type === "auto") return "Use a tool only when needed."
+      if (toolChoice.type === "required") return "You must emit a tool call before giving a final answer."
+      if (toolChoice.type === "tool") return `You must call the tool named ${toolChoice.toolName}.`
+      return "Do not call any tool unless the conversation explicitly requires it."
+    })()
+
+    return [
+      "Native function calling is unavailable for this model. Use text-based tool calling instead.",
+      choiceInstruction,
+      `When you need a tool, reply with exactly one block in this format and nothing else: ${PROMPT_TOOL_CALL_OPEN}{\"name\":\"tool_name\",\"arguments\":{}}${PROMPT_TOOL_CALL_CLOSE}`,
+      "Rules:",
+      "- Do not use markdown fences around the tool block.",
+      "- The JSON must be valid.",
+      "- The arguments value must be a JSON object.",
+      "- After tool results are returned, continue the task or emit another tool block.",
+      "Available tools:",
+      toolList,
+    ].join("\n")
+  }
+
+  function assistantContentToText(content: Array<any>) {
+    const chunks: string[] = []
+    for (const part of content) {
+      if (part.type === "text" || part.type === "reasoning") {
+        if (part.text) chunks.push(part.text)
+        continue
+      }
+      if (part.type === "tool-call") {
+        chunks.push(`${PROMPT_TOOL_CALL_OPEN}${JSON.stringify({ name: part.toolName, arguments: part.input })}${PROMPT_TOOL_CALL_CLOSE}`)
+      }
+    }
+    return chunks.join("\n").trim()
+  }
+
+  function toolResultsToText(content: Array<any>) {
+    const chunks = content.map((part) => {
+      return `Tool result for ${part.toolName} (call_id=${part.toolCallId}):\n${serializeToolResultOutput(part.output)}`
+    })
+    return chunks.join("\n\n").trim()
+  }
+
+  function serializeToolResultOutput(output: LanguageModelV2ToolResultOutput) {
+    switch (output.type) {
+      case "text":
+      case "error-text":
+        return output.value
+      case "json":
+      case "error-json":
+        return JSON.stringify(output.value)
+      case "content":
+        return JSON.stringify(output.value)
+    }
+  }
+
+  function rewriteGenerateResultForPromptToolCalling(
+    result: {
+      content: LanguageModelV2Content[]
+      finishReason: LanguageModelV2FinishReason
+      usage: LanguageModelV2Usage
+      warnings: LanguageModelV2CallWarning[]
+      providerMetadata?: SharedV2ProviderMetadata
+      request?: { body?: unknown }
+      response?: any
+    },
+    params: LanguageModelV2CallOptions,
+  ) {
+    const functionTools = getPromptToolCallingState(params)?.tools ?? []
+    const rewrittenContent = rewriteContentForPromptToolCalling(result.content, functionTools)
+    return {
+      ...result,
+      content: rewrittenContent,
+      finishReason: rewrittenContent.some((part) => part.type === "tool-call") ? ("tool-calls" as LanguageModelV2FinishReason) : result.finishReason,
+    }
+  }
+
+  function rewriteContentForPromptToolCalling(
+    content: LanguageModelV2Content[],
+    tools: LanguageModelV2FunctionTool[],
+  ): LanguageModelV2Content[] {
+    const toolNames = new Set(tools.map((tool) => tool.name))
+    const rewritten: LanguageModelV2Content[] = []
+    let toolIndex = 0
+
+    for (const part of content) {
+      if (part.type !== "text") {
+        rewritten.push(part)
+        continue
+      }
+
+      for (const parsed of parsePromptToolCalls(part.text)) {
+        if (parsed.type === "text") {
+          if (parsed.text) rewritten.push({ type: "text", text: parsed.text })
+          continue
+        }
+
+        if (!toolNames.has(parsed.toolName)) {
+          rewritten.push({
+            type: "text",
+            text: `${PROMPT_TOOL_CALL_OPEN}${parsed.raw}${PROMPT_TOOL_CALL_CLOSE}`,
+          })
+          continue
+        }
+
+        rewritten.push({
+          type: "tool-call",
+          toolCallId: `prompt-tool-${++toolIndex}`,
+          toolName: parsed.toolName,
+          input: JSON.stringify(parsed.input),
+          providerExecuted: false,
+        } as LanguageModelV2Content)
+      }
+    }
+
+    return rewritten
+  }
+
+  function parsePromptToolCalls(text: string) {
+    const result: Array<{ type: "text"; text: string } | { type: "tool-call"; toolName: string; input: Record<string, unknown>; raw: string }> = []
+    const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g
+    let lastIndex = 0
+
+    for (const match of text.matchAll(regex)) {
+      const [full, rawJson] = match
+      const start = match.index ?? 0
+
+      if (start > lastIndex) {
+        result.push({ type: "text", text: text.slice(lastIndex, start) })
+      }
+
+      const parsed = parsePromptToolCallJson(rawJson)
+      if (parsed) {
+        result.push({
+          type: "tool-call",
+          toolName: parsed.toolName,
+          input: parsed.input,
+          raw: rawJson,
+        })
+      } else {
+        result.push({ type: "text", text: full })
+      }
+
+      lastIndex = start + full.length
+    }
+
+    if (lastIndex < text.length) {
+      result.push({ type: "text", text: text.slice(lastIndex) })
+    }
+
+    return result
+  }
+
+  function parsePromptToolCallJson(rawJson: string) {
+    try {
+      const parsed = JSON.parse(rawJson) as { name?: unknown; arguments?: unknown }
+      if (typeof parsed.name !== "string") return undefined
+      if (!parsed.arguments || typeof parsed.arguments !== "object" || Array.isArray(parsed.arguments)) return undefined
+      return {
+        toolName: parsed.name,
+        input: parsed.arguments as Record<string, unknown>,
+      }
+    } catch {
+      return undefined
+    }
   }
 
   function referencedToolNames(messages: ModelMessage[]) {
