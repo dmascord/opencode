@@ -48,6 +48,7 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 
 export namespace Server {
   const log = Log.create({ service: "server" })
+  const WEBSOCKET_IDLE_TIMEOUT = 45
 
   let _url: URL | undefined
   let _corsWhitelist: string[] = []
@@ -311,24 +312,7 @@ export namespace Server {
             },
           }),
           async (c) => {
-            const all = await Auth.all()
-            const result: Record<
-              string,
-              {
-                accounts: Awaited<ReturnType<typeof Auth.OAuthPool.getUsage>>
-                anthropicUsage?: Awaited<ReturnType<typeof Auth.OAuthPool.fetchAnthropicUsage>>
-              }
-            > = {}
-
-            for (const [providerID, info] of Object.entries(all)) {
-              if (info.type === "oauth") {
-                const accounts = await Auth.OAuthPool.getUsage(providerID)
-                const anthropicUsage = await Auth.OAuthPool.fetchAnthropicUsage(providerID)
-                result[providerID] = { accounts, anthropicUsage: anthropicUsage ?? undefined }
-              }
-            }
-
-            return c.json(result)
+            return c.json(await Auth.usage())
           },
         )
         .post(
@@ -724,7 +708,11 @@ export namespace Server {
       hostname: opts.hostname,
       idleTimeout: 0,
       fetch: App().fetch,
-      websocket: websocket,
+      websocket: {
+        ...websocket,
+        idleTimeout: WEBSOCKET_IDLE_TIMEOUT,
+        sendPings: true,
+      },
     } as const
     const tryServe = (port: number) => {
       try {

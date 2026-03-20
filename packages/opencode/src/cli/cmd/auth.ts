@@ -114,14 +114,35 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
     }
 
     if (authorize.method === "code") {
-      const code = await prompts.text({
-        message: "Paste the authorization code here: ",
+      const input = await prompts.text({
+        message: authorize.instructions || "Paste the authorization callback URL here: ",
         validate: (x) => (x && x.length > 0 ? undefined : "Required"),
       })
-      if (prompts.isCancel(code)) throw new UI.CancelledError()
-      const result = await authorize.callback(code)
+      if (prompts.isCancel(input)) throw new UI.CancelledError()
+      
+      // Extract code and state from the callback URL
+      let code = input
+      let state: string | undefined
+      
+      // If it's a full URL, extract the parameters
+      if (input.includes("?") || input.includes("#")) {
+        try {
+          const url = new URL(input)
+          code = url.searchParams.get("code") || input
+          state = url.searchParams.get("state") || url.hash.split("state=")[1]?.split("&")[0]
+        } catch {
+          // If URL parsing fails, treat as raw code
+        }
+      }
+      
+      const spinner = prompts.spinner()
+      spinner.start("Authorizing...")
+      const result = await authorize.callback(code, state, (message) => {
+        spinner.message(message)
+      })
       if (result.type === "failed") {
-        prompts.log.error("Failed to authorize")
+        spinner.stop("Authorization failed", 1)
+        prompts.log.error(result.error ? `Failed to authorize: ${result.error}` : "Failed to authorize")
       }
       if (result.type === "success") {
         const saveProvider = result.provider ?? provider
@@ -141,6 +162,7 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
             key: result.key,
           })
         }
+        spinner.stop("Login successful")
         prompts.log.success("Login successful")
       }
     }

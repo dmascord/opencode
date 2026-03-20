@@ -7,6 +7,8 @@ import { NotFoundError } from "../../storage/db"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 
+const PTY_IDLE_TIMEOUT = 45
+
 export const PtyRoutes = lazy(() =>
   new Hono()
     .get(
@@ -176,6 +178,8 @@ export const PtyRoutes = lazy(() =>
         }
 
         return {
+          idleTimeout: PTY_IDLE_TIMEOUT,
+          sendPings: true,
           onOpen(_event, ws) {
             const socket = ws.raw
             if (!isSocket(socket)) {

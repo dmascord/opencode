@@ -165,6 +165,7 @@ export namespace McpOAuthCallback {
         port: OAUTH_CALLBACK_PORT,
         socket: {
           open(socket) {
+            socket.setKeepAlive(true, 10_000)
             socket.end()
             resolve(true)
           },

@@ -11,6 +11,8 @@ import { createOpencodeClient, type Event } from "@opencode-ai/sdk/v2"
 import type { BunWebSocketData } from "hono/bun"
 import { Flag } from "@/flag/flag"
 
+const SSE_WATCHDOG_MS = 30_000
+
 await Log.init({
   print: process.argv.includes("--print-logs"),
   dev: Installation.isLocal(),
@@ -41,6 +43,7 @@ let server: Bun.Server<BunWebSocketData> | undefined
 
 const eventStream = {
   abort: undefined as AbortController | undefined,
+  live: undefined as AbortController | undefined,
 }
 
 const startEventStream = (directory: string) => {
@@ -48,6 +51,19 @@ const startEventStream = (directory: string) => {
   const abort = new AbortController()
   eventStream.abort = abort
   const signal = abort.signal
+  let watchdog: Timer | undefined
+  let stale = false
+  let watch = false
+
+  const touch = () => {
+    if (!watch) return
+    stale = false
+    if (watchdog) clearTimeout(watchdog)
+    watchdog = setTimeout(() => {
+      stale = true
+      eventStream.live?.abort(new Error("Worker event stream heartbeat timed out"))
+    }, SSE_WATCHDOG_MS)
+  }
 
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input, init)
@@ -64,28 +80,51 @@ const startEventStream = (directory: string) => {
   })
 
   ;(async () => {
-    while (!signal.aborted) {
-      const events = await Promise.resolve(
-        sdk.event.subscribe(
-          {},
-          {
-            signal,
-          },
-        ),
-      ).catch(() => undefined)
+    watch = true
+    touch()
+    try {
+      while (!signal.aborted) {
+        const cycle = new AbortController()
+        eventStream.live = cycle
+        const combined = AbortSignal.any([signal, cycle.signal])
+        const events = await Promise.resolve(sdk.event.subscribe({}, { signal: combined })).catch((error) => {
+          if (signal.aborted) return undefined
+          if (!stale) throw error
+          return undefined
+        })
 
-      if (!events) {
-        await Bun.sleep(250)
-        continue
-      }
+        if (!events) {
+          touch()
+          await Bun.sleep(250)
+          continue
+        }
 
-      for await (const event of events.stream) {
-        Rpc.emit("event", event as Event)
-      }
+        try {
+          for await (const event of events.stream) {
+            const type = event.type as string
+            touch()
+            if (type === "server.heartbeat" || type === "server.connected") continue
+            Rpc.emit("event", event as Event)
+          }
+        } catch (error) {
+          if (signal.aborted) break
+          if (combined.aborted && stale) {
+            touch()
+            continue
+          }
+          throw error
+        } finally {
+          cycle.abort()
+          if (eventStream.live === cycle) eventStream.live = undefined
+        }
 
-      if (!signal.aborted) {
-        await Bun.sleep(250)
+        if (!signal.aborted) {
+          touch()
+          await Bun.sleep(250)
+        }
       }
+    } finally {
+      if (watchdog) clearTimeout(watchdog)
     }
   })().catch((error) => {
     Log.Default.error("event stream error", {
@@ -136,6 +175,7 @@ export const rpc = {
   },
   async shutdown() {
     Log.Default.info("worker shutting down")
+    eventStream.live?.abort()
     if (eventStream.abort) eventStream.abort.abort()
     await Instance.disposeAll()
     if (server) server.stop(true)

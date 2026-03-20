@@ -84,7 +84,7 @@ export namespace ProviderAuth {
 
       if (match.method === "code") {
         if (!input.code) throw new OauthCodeMissing({ providerID: input.providerID })
-        result = await match.callback(input.code)
+        result = await match.callback(input.code, undefined, undefined)
       }
 
       if (match.method === "auto") {
@@ -113,7 +113,9 @@ export namespace ProviderAuth {
         return
       }
 
-      throw new OauthCallbackFailed({})
+      throw new OauthCallbackFailed({
+        error: result?.type === "failed" ? result.error : undefined,
+      })
     },
   )
 
@@ -143,5 +145,10 @@ export namespace ProviderAuth {
     }),
   )
 
-  export const OauthCallbackFailed = NamedError.create("ProviderAuthOauthCallbackFailed", z.object({}))
+  export const OauthCallbackFailed = NamedError.create(
+    "ProviderAuthOauthCallbackFailed",
+    z.object({
+      error: z.string().optional(),
+    }),
+  )
 }

@@ -162,9 +162,9 @@ async function ensurePuppeteer(onProgress?: (msg: string) => void) {
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 const ANTHROPIC_OAUTH_AUTHORIZE = "https://claude.ai/oauth/authorize"
-const ANTHROPIC_OAUTH_TOKEN = "https://console.anthropic.com/v1/oauth/token"
-const OAUTH_CALLBACK = "https://console.anthropic.com/oauth/code/callback"
-const OAUTH_CALLBACK_ALT = "https://platform.claude.com/oauth/code/callback"
+const ANTHROPIC_OAUTH_TOKEN = "https://platform.claude.com/v1/oauth/token"
+const OAUTH_CALLBACK = "https://platform.claude.com/oauth/code/callback"
+const USER_AGENT = "claude-cli/2.1.80 (external, cli)"
 
 // Lock to prevent concurrent browser operations on same profile
 const browserLocks = new Map<string, Promise<any>>()
@@ -441,12 +441,12 @@ export namespace AuthBrowser {
     // Generate PKCE for OAuth
     const pkce = await generatePKCE()
 
-    // Build authorize URL
+    // Build authorize URL using the current Claude CLI callback target
     const authorizeUrl = new URL(ANTHROPIC_OAUTH_AUTHORIZE)
     authorizeUrl.searchParams.set("code", "true")
     authorizeUrl.searchParams.set("client_id", CLIENT_ID)
     authorizeUrl.searchParams.set("response_type", "code")
-    authorizeUrl.searchParams.set("redirect_uri", OAUTH_CALLBACK)
+    authorizeUrl.searchParams.set("redirect_uri", "https://platform.claude.com/oauth/code/callback")
     authorizeUrl.searchParams.set("scope", "org:create_api_key user:profile user:inference")
     authorizeUrl.searchParams.set("code_challenge", pkce.challenge)
     authorizeUrl.searchParams.set("code_challenge_method", "S256")
@@ -470,12 +470,7 @@ export namespace AuthBrowser {
         try {
           const currentUrl = page.url()
 
-          // Check both callback URLs - console.anthropic.com and platform.claude.com
-          if (
-            currentUrl.includes(OAUTH_CALLBACK) ||
-            currentUrl.includes(OAUTH_CALLBACK_ALT) ||
-            currentUrl.includes("/oauth/code/callback")
-          ) {
+          if (currentUrl.includes(OAUTH_CALLBACK) || currentUrl.includes("/oauth/code/callback")) {
             log.info("detected callback URL", { currentUrl })
 
             // Code can be in hash or query params
@@ -593,12 +588,12 @@ export namespace AuthBrowser {
     // Generate PKCE for OAuth
     const pkce = await generatePKCE()
 
-    // Build authorize URL
+    // Build authorize URL - use platform.claude.com as default (most users are redirected there)
     const authorizeUrl = new URL(ANTHROPIC_OAUTH_AUTHORIZE)
     authorizeUrl.searchParams.set("code", "true")
     authorizeUrl.searchParams.set("client_id", CLIENT_ID)
     authorizeUrl.searchParams.set("response_type", "code")
-    authorizeUrl.searchParams.set("redirect_uri", OAUTH_CALLBACK)
+    authorizeUrl.searchParams.set("redirect_uri", "https://platform.claude.com/oauth/code/callback")
     authorizeUrl.searchParams.set("scope", "org:create_api_key user:profile user:inference")
     authorizeUrl.searchParams.set("code_challenge", pkce.challenge)
     authorizeUrl.searchParams.set("code_challenge_method", "S256")
@@ -622,12 +617,7 @@ export namespace AuthBrowser {
         try {
           const currentUrl = page.url()
 
-          // Check both callback URLs
-          if (
-            currentUrl.includes(OAUTH_CALLBACK) ||
-            currentUrl.includes(OAUTH_CALLBACK_ALT) ||
-            currentUrl.includes("/oauth/code/callback")
-          ) {
+          if (currentUrl.includes(OAUTH_CALLBACK) || currentUrl.includes("/oauth/code/callback")) {
             log.info("detected callback URL", { currentUrl })
 
             const urlObj = new URL(currentUrl)
@@ -800,7 +790,10 @@ export namespace AuthBrowser {
     const response = await fetch(ANTHROPIC_OAUTH_TOKEN, {
       method: "POST",
       headers: {
+        Accept: "application/json",
         "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "user-agent": USER_AGENT,
       },
       body: JSON.stringify({
         code: cleanCode,

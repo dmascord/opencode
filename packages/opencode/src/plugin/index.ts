@@ -8,6 +8,7 @@ import { BunProc } from "../bun"
 import { Instance } from "../project/instance"
 import { Flag } from "../flag/flag"
 import { CodexAuthPlugin } from "./codex"
+import { AnthropicAuthPlugin } from "./anthropic"
 import { Session } from "../session"
 import { NamedError } from "@opencode-ai/util/error"
 import { CopilotAuthPlugin } from "./copilot"
@@ -16,10 +17,11 @@ import { gitlabAuthPlugin as GitlabAuthPlugin } from "@gitlab/opencode-gitlab-au
 export namespace Plugin {
   const log = Log.create({ service: "plugin" })
 
-  const BUILTIN = ["opencode-anthropic-auth@0.0.13"]
+  // Anthropic OAuth is now handled internally - no external plugin needed
+  const BUILTIN: string[] = []
 
   // Built-in plugins that are directly imported (not installed from npm)
-  const INTERNAL_PLUGINS: PluginInstance[] = [CodexAuthPlugin, CopilotAuthPlugin, GitlabAuthPlugin]
+  const INTERNAL_PLUGINS: PluginInstance[] = [AnthropicAuthPlugin, CodexAuthPlugin, CopilotAuthPlugin, GitlabAuthPlugin]
 
   const state = Instance.state(async () => {
     const client = createOpencodeClient({
