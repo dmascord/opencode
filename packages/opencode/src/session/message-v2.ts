@@ -999,7 +999,25 @@ export namespace MessageV2 {
           { cause: e },
         ).toObject()
       case e instanceof Error:
-        return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
+        if (e.name === "TimeoutError" || /timed out/i.test(e.message)) {
+          return new MessageV2.APIError(
+            {
+              message: e.message || "Request timed out",
+              isRetryable: true,
+            },
+            { cause: e },
+          ).toObject()
+        }
+        if (/network|fetch failed|socket|econnreset|timed out/i.test(e.message)) {
+          return new MessageV2.APIError(
+            {
+              message: e.message,
+              isRetryable: true,
+            },
+            { cause: e },
+          ).toObject()
+        }
+        return new NamedError.Unknown({ message: e.toString() }, { cause: e }).toObject()
       default:
         try {
           const parsed = ProviderError.parseStreamError(e)

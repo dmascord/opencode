@@ -7,8 +7,10 @@ import { PtyID } from "@/pty/schema"
 import { NotFoundError } from "../../storage/db"
 import { errors } from "../error"
 
-export function PtyRoutes(upgradeWebSocket: UpgradeWebSocket) {
-  return new Hono()
+const PTY_IDLE_TIMEOUT = 45
+
+export const PtyRoutes = lazy(() =>
+  new Hono()
     .get(
       "/",
       describeRoute({
@@ -179,7 +181,9 @@ export function PtyRoutes(upgradeWebSocket: UpgradeWebSocket) {
         let ready = false
 
         return {
-          async onOpen(_event, ws) {
+          idleTimeout: PTY_IDLE_TIMEOUT,
+          sendPings: true,
+          onOpen(_event, ws) {
             const socket = ws.raw
             if (!isSocket(socket)) {
               ws.close()

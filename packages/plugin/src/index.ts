@@ -148,12 +148,13 @@ export type AuthOAuthResult = { url: string; instructions: string } & (
           ))
         | {
             type: "failed"
+            error?: string
           }
       >
     }
   | {
       method: "code"
-      callback(code: string): Promise<
+      callback(code: string, state?: string, progress?: (message: string) => void): Promise<
         | ({
             type: "success"
             provider?: string
@@ -169,6 +170,7 @@ export type AuthOAuthResult = { url: string; instructions: string } & (
           ))
         | {
             type: "failed"
+            error?: string
           }
       >
     }

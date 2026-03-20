@@ -34,7 +34,7 @@ export namespace Server {
   }
 
   const log = Log.create({ service: "server" })
-  const zipped = compress()
+  const WEBSOCKET_IDLE_TIMEOUT = 45
 
   const skipCompress = (path: string, method: string) => {
     if (path === "/event" || path === "/global/event" || path === "/global/sync-event") return true
@@ -180,6 +180,128 @@ export namespace Server {
           }),
         ),
       )
+      .route("/project", ProjectRoutes())
+      .route("/pty", PtyRoutes())
+      .route("/config", ConfigRoutes())
+      .route("/experimental", ExperimentalRoutes())
+      .route("/session", SessionRoutes())
+      .route("/permission", PermissionRoutes())
+      .route("/question", QuestionRoutes())
+      .route("/provider", ProviderRoutes())
+      .route("/", FileRoutes())
+      .route("/", EventRoutes())
+      .route("/mcp", McpRoutes())
+      .route("/tui", TuiRoutes())
+      .post(
+        "/instance/dispose",
+        describeRoute({
+          summary: "Dispose instance",
+          description: "Clean up and dispose the current OpenCode instance, releasing all resources.",
+          operationId: "instance.dispose",
+          responses: {
+            200: {
+              description: "Instance disposed",
+              content: {
+                "application/json": {
+                  schema: resolver(z.boolean()),
+                },
+              },
+            },
+          }),
+          async (c) => {
+            return c.json(await Auth.usage())
+          },
+        }),
+        async (c) => {
+          await Instance.dispose()
+          return c.json(true)
+        },
+      )
+      .get(
+        "/path",
+        describeRoute({
+          summary: "Get paths",
+          description: "Retrieve the current working directory and related path information for the OpenCode instance.",
+          operationId: "path.get",
+          responses: {
+            200: {
+              description: "Path",
+              content: {
+                "application/json": {
+                  schema: resolver(
+                    z
+                      .object({
+                        home: z.string(),
+                        state: z.string(),
+                        config: z.string(),
+                        worktree: z.string(),
+                        directory: z.string(),
+                      })
+                      .meta({
+                        ref: "Path",
+                      }),
+                  ),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          return c.json({
+            home: Global.Path.home,
+            state: Global.Path.state,
+            config: Global.Path.config,
+            worktree: Instance.worktree,
+            directory: Instance.directory,
+          })
+        },
+      )
+      .get(
+        "/vcs",
+        describeRoute({
+          summary: "Get VCS info",
+          description: "Retrieve version control system (VCS) information for the current project, such as git branch.",
+          operationId: "vcs.get",
+          responses: {
+            200: {
+              description: "VCS info",
+              content: {
+                "application/json": {
+                  schema: resolver(Vcs.Info),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          const branch = await runPromiseInstance(Vcs.Service.use((s) => s.branch()))
+          return c.json({
+            branch,
+          })
+        },
+      )
+      .get(
+        "/command",
+        describeRoute({
+          summary: "List commands",
+          description: "Get a list of all available commands in the OpenCode system.",
+          operationId: "command.list",
+          responses: {
+            200: {
+              description: "List of commands",
+              content: {
+                "application/json": {
+                  schema: resolver(Command.Info.array()),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          const commands = await Command.list()
+          return c.json(commands)
+        },
+      )
       .post(
         "/log",
         describeRoute({
@@ -276,35 +398,30 @@ export namespace Server {
     mdns?: boolean
     mdnsDomain?: string
     cors?: string[]
-  }): Promise<Listener> {
-    const built = create(opts)
-    const start = (port: number) =>
-      new Promise<ServerType>((resolve, reject) => {
-        const server = createAdaptorServer({ fetch: built.app.fetch })
-        built.ws.injectWebSocket(server)
-        const fail = (err: Error) => {
-          cleanup()
-          reject(err)
-        }
-        const ready = () => {
-          cleanup()
-          resolve(server)
-        }
-        const cleanup = () => {
-          server.off("error", fail)
-          server.off("listening", ready)
-        }
-        server.once("error", fail)
-        server.once("listening", ready)
-        server.listen(port, opts.hostname)
-      })
-
-    const server = opts.port === 0 ? await start(4096).catch(() => start(0)) : await start(opts.port)
-    const addr = server.address()
-    if (!addr || typeof addr === "string") {
-      throw new Error(`Failed to resolve server address for port ${opts.port}`)
+  }) {
+    url = new URL(`http://${opts.hostname}:${opts.port}`)
+    const app = createApp(opts)
+    const args = {
+      hostname: opts.hostname,
+      idleTimeout: 0,
+      fetch: app.fetch,
+      websocket: {
+        ...websocket,
+        idleTimeout: WEBSOCKET_IDLE_TIMEOUT,
+        sendPings: true,
+      },
+    } as const
+    const tryServe = (port: number) => {
+      try {
+        return Bun.serve({ ...args, port })
+      } catch {
+        return undefined
+      }
     }
+    const server = opts.port === 0 ? (tryServe(4096) ?? tryServe(0)) : tryServe(opts.port)
+    if (!server) throw new Error(`Failed to start server on port ${opts.port}`)
 
+    const addr = server.address
     const next = new URL("http://localhost")
     next.hostname = opts.hostname
     next.port = String(addr.port)

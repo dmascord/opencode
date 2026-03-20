@@ -9,11 +9,16 @@ import { Config } from "@/config/config"
 import { Bus } from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import type { Event } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { Flag } from "@/flag/flag"
 import { setTimeout as sleep } from "node:timers/promises"
 import { writeHeapSnapshot } from "node:v8"
 import { WorkspaceID } from "@/control-plane/schema"
 import { Heap } from "@/cli/heap"
+
+const fetchFn = (url: string, init?: RequestInit) => Server.Default().fetch(url, init)
+
+const SSE_WATCHDOG_MS = 30_000
 
 await Log.init({
   print: process.argv.includes("--print-logs"),
@@ -45,71 +50,85 @@ GlobalBus.on("event", (event) => {
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 
-const eventStreams = new Map<string, AbortController>()
+const eventStream = {
+  abort: undefined as AbortController | undefined,
+  live: undefined as AbortController | undefined,
+}
 
 function startEventStream(directory: string) {
   const id = crypto.randomUUID()
 
   const abort = new AbortController()
   const signal = abort.signal
+  let watchdog: Timer | undefined
+  let stale = false
+  let watch = false
 
-  eventStreams.set(id, abort)
-
-  async function run() {
-    while (!signal.aborted) {
-      const shouldReconnect = await Instance.provide({
-        directory,
-        init: InstanceBootstrap,
-        fn: () =>
-          new Promise<boolean>((resolve) => {
-            Rpc.emit("event", {
-              type: "server.connected",
-              properties: {},
-            } satisfies Event)
-
-            let settled = false
-            const settle = (value: boolean) => {
-              if (settled) return
-              settled = true
-              signal.removeEventListener("abort", onAbort)
-              unsub()
-              resolve(value)
-            }
-
-            const unsub = Bus.subscribeAll((event) => {
-              Rpc.emit("event", {
-                id,
-                event: event as Event,
-              })
-              if (event.type === Bus.InstanceDisposed.type) {
-                settle(true)
-              }
-            })
-
-            const onAbort = () => {
-              settle(false)
-            }
-
-            signal.addEventListener("abort", onAbort, { once: true })
-          }),
-      }).catch((error) => {
-        Log.Default.error("event stream subscribe error", {
-          error: error instanceof Error ? error.message : error,
-        })
-        return false
-      })
-
-      if (!shouldReconnect || signal.aborted) {
-        break
-      }
-
-      if (!signal.aborted) {
-        await sleep(250)
-      }
-    }
+  const touch = () => {
+    if (!watch) return
+    stale = false
+    if (watchdog) clearTimeout(watchdog)
+    watchdog = setTimeout(() => {
+      stale = true
+      eventStream.live?.abort(new Error("Worker event stream heartbeat timed out"))
+    }, SSE_WATCHDOG_MS)
   }
 
-  run().catch((error) => {
+  const sdk = createOpencodeClient({
+    baseUrl: "http://opencode.internal",
+    directory,
+    fetch: fetchFn,
+    signal,
+  })
+
+  ;(async () => {
+    watch = true
+    touch()
+    try {
+      while (!signal.aborted) {
+        const cycle = new AbortController()
+        eventStream.live = cycle
+        const combined = AbortSignal.any([signal, cycle.signal])
+        const events = await Promise.resolve(sdk.event.subscribe({}, { signal: combined })).catch((error) => {
+          if (signal.aborted) return undefined
+          if (!stale) throw error
+          return undefined
+        })
+
+        if (!events) {
+          touch()
+          await sleep(250)
+          continue
+        }
+
+        try {
+          for await (const event of events.stream) {
+            const type = event.type as string
+            touch()
+            if (type === "server.heartbeat" || type === "server.connected") continue
+            Rpc.emit("event", event as Event)
+          }
+        } catch (error) {
+          if (signal.aborted) break
+          if (combined.aborted && stale) {
+            touch()
+            continue
+          }
+          throw error
+        } finally {
+          cycle.abort()
+          if (eventStream.live === cycle) eventStream.live = undefined
+        }
+
+        if (!signal.aborted) {
+          touch()
+          await sleep(250)
+        }
+      }
+    } finally {
+      if (watchdog) clearTimeout(watchdog)
+    }
+  })().catch((error) => {
     Log.Default.error("event stream error", {
       error: error instanceof Error ? error.message : error,
     })
@@ -119,11 +138,7 @@ function startEventStream(directory: string) {
 }
 
 function stopEventStream(id: string) {
-  const abortController = eventStreams.get(id)
-  if (!abortController) return
-
-  abortController.abort()
-  eventStreams.delete(id)
+  eventStream.abort?.abort()
 }
 
 export const rpc = {
@@ -176,10 +191,8 @@ export const rpc = {
   async shutdown() {
     Log.Default.info("worker shutting down")
 
-    for (const id of [...eventStreams.keys()]) {
-      stopEventStream(id)
-    }
-
+    eventStream.live?.abort()
+    if (eventStream.abort) eventStream.abort.abort()
     await Instance.disposeAll()
     if (server) await server.stop(true)
   },

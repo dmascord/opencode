@@ -186,6 +186,7 @@ export namespace McpOAuthCallback {
     return new Promise((resolve) => {
       const socket = createConnection(OAUTH_CALLBACK_PORT, "127.0.0.1")
       socket.on("connect", () => {
+        socket.setKeepAlive(true, 10_000)
         socket.destroy()
         resolve(true)
       })

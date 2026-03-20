@@ -3,6 +3,8 @@ import { createSimpleContext } from "./helper"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { batch, onCleanup, onMount } from "solid-js"
 
+const SSE_WATCHDOG_MS = 30_000
+
 export type EventSource = {
   subscribe: (directory: string | undefined, handler: (event: Event) => void) => Promise<() => void>
 }
@@ -38,6 +40,20 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     let queue: Event[] = []
     let timer: Timer | undefined
     let last = 0
+    let watchdog: Timer | undefined
+    let stale = false
+    let live: AbortController | undefined
+    let watch = false
+
+    const touch = () => {
+      if (!watch) return
+      stale = false
+      if (watchdog) clearTimeout(watchdog)
+      watchdog = setTimeout(() => {
+        stale = true
+        live?.abort(new Error("Event stream heartbeat timed out"))
+      }, SSE_WATCHDOG_MS)
+    }
 
     const flush = () => {
       if (queue.length === 0) return
@@ -54,6 +70,9 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     }
 
     const handleEvent = (event: Event) => {
+      const type = event.type as string
+      touch()
+      if (type === "server.heartbeat" || type === "server.connected") return
       queue.push(event)
       const elapsed = Date.now() - last
 
@@ -74,15 +93,40 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       ;(async () => {
         while (true) {
           if (abort.signal.aborted || ctrl.signal.aborted) break
-          const events = await sdk.event.subscribe({}, { signal: ctrl.signal })
+          const cycle = new AbortController()
+          live = cycle
+          const signal = AbortSignal.any([ctrl.signal, cycle.signal])
+          const events = await sdk.event.subscribe({}, { signal }).catch((error) => {
+            if (abort.signal.aborted || ctrl.signal.aborted) return undefined
+            if (!stale) throw error
+            return undefined
+          })
+          if (!events) {
+            touch()
+            await Bun.sleep(250)
+            continue
+          }
 
-          for await (const event of events.stream) {
-            if (ctrl.signal.aborted) break
-            handleEvent(event)
+          try {
+            for await (const event of events.stream) {
+              if (ctrl.signal.aborted) break
+              handleEvent(event)
+            }
+          } catch (error) {
+            if (abort.signal.aborted || ctrl.signal.aborted) break
+            if (signal.aborted && stale) {
+              touch()
+              continue
+            }
+            if (!stale) throw error
+          } finally {
+            cycle.abort()
+            if (live === cycle) live = undefined
           }
 
           if (timer) clearTimeout(timer)
           if (queue.length > 0) flush()
+          touch()
         }
       })().catch(() => {})
     }
@@ -94,12 +138,18 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       } else {
         startSSE()
       }
+
+      // Fall back to SSE
+      watch = true
+      touch()
+      startSSE()
     })
 
     onCleanup(() => {
       abort.abort()
       sse?.abort()
       if (timer) clearTimeout(timer)
+      if (watchdog) clearTimeout(watchdog)
     })
 
     return {

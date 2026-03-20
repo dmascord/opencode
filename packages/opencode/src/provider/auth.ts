@@ -75,7 +75,12 @@ export namespace ProviderAuth {
     z.object({ providerID: ProviderID.zod }),
   )
 
-  export const OauthCallbackFailed = NamedError.create("ProviderAuthOauthCallbackFailed", z.object({}))
+  export const OauthCallbackFailed = NamedError.create(
+    "ProviderAuthOauthCallbackFailed",
+    z.object({
+      error: z.string().optional(),
+    }),
+  )
 
   export const ValidationFailed = NamedError.create(
     "ProviderAuthValidationFailed",
@@ -202,9 +207,11 @@ export namespace ProviderAuth {
         }
 
         const result = yield* Effect.promise(() =>
-          match.method === "code" ? match.callback(input.code!) : match.callback(),
+          match.method === "code" ? match.callback(input.code!, undefined, undefined) : match.callback(),
         )
-        if (!result || result.type !== "success") return yield* Effect.fail(new OauthCallbackFailed({}))
+        if (!result || result.type !== "success") {
+          return yield* Effect.fail(new OauthCallbackFailed({ error: result?.type === "failed" ? result.error : undefined }))
+        }
 
         if ("key" in result) {
           yield* auth.set(input.providerID, {
