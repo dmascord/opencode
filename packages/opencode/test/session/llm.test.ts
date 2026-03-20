@@ -763,12 +763,12 @@ describe("session.llm.stream", () => {
         for await (const part of stream.fullStream) {
           parts.push(part.type)
           if (part.type === "error") {
-            errors.push(part.error.message)
+            errors.push(part.error instanceof Error ? part.error.message : String(part.error))
           }
         }
 
         const capture = await request
-        const body = capture.body
+        const body = capture.body as { tools?: unknown; tool_choice?: unknown; messages: Array<unknown> }
         expect(body.tools).toBeUndefined()
         expect(body.tool_choice).toBeUndefined()
         expect(body.messages.length).toBeGreaterThan(0)

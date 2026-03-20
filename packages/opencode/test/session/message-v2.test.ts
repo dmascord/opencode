@@ -50,6 +50,7 @@ const model: Provider.Model = {
   status: "active",
   options: {},
   headers: {},
+  runtime: {},
   release_date: "2026-01-01",
 }
 

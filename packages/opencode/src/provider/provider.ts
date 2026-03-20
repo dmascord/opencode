@@ -704,6 +704,16 @@ export namespace Provider {
     })
   export type Info = z.infer<typeof Info>
 
+  type ProviderConfigValue = NonNullable<Awaited<ReturnType<typeof Config.get>>["provider"]>[string]
+  type ProviderOverrideValue = {
+    name?: string
+    env?: string[]
+    npm?: string
+    api?: string
+    options?: Record<string, unknown>
+    models?: Record<string, any>
+  }
+
   function defaultRuntimePolicy(model: Pick<Model, "providerID" | "id" | "api">): Model["runtime"] {
     return {
       ...(PROVIDER_RUNTIME_POLICY[model.providerID as keyof typeof PROVIDER_RUNTIME_POLICY] ?? {}),
@@ -833,8 +843,8 @@ export namespace Provider {
 
     log.info("init")
 
-    const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES)
-    const configProviders = Object.entries(config.provider ?? {})
+    const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES) as Array<[string, ProviderOverrideValue]>
+    const configProviders = Object.entries(config.provider ?? {}) as Array<[string, ProviderConfigValue]>
 
     // Add GitHub Copilot Enterprise provider that inherits from GitHub Copilot
     if (database["github-copilot"]) {
@@ -943,7 +953,7 @@ export namespace Provider {
         }
         const merged = mergeDeep(ProviderTransform.variants(parsedModel), model.variants ?? {})
         parsedModel.variants = mapValues(
-          pickBy(merged, (v) => !v.disabled),
+          pickBy(merged, (v) => !(v as { disabled?: boolean }).disabled),
           (v) => omit(v, ["disabled"]),
         )
         parsed.models[modelID] = parsedModel

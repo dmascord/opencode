@@ -9,9 +9,9 @@ const sleep = Bun.sleep
 const input = {
   client: {} as never,
   project: {} as never,
-  worktree: undefined,
+  worktree: "/tmp",
   directory: "/tmp",
-  serverUrl: "http://localhost",
+  serverUrl: new URL("http://localhost"),
   $: Bun.$,
 } satisfies PluginInput
 

@@ -420,6 +420,7 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
             status: "active" as const,
             options: {},
             headers: {},
+            runtime: {},
             release_date: "2026-02-05",
             variants: {} as Record<string, Record<string, any>>,
             family: "gpt-codex",
