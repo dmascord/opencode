@@ -136,6 +136,15 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV3 {
       toolChoice,
     })
 
+    // Azure APIM requires max_completion_tokens instead of max_tokens for GPT-5 models
+    // Check for "azure" in provider name (case-insensitive) or baseURL to handle Azure via APIM
+    const providerNameLower = this.providerOptionsName.toLowerCase()
+    const isAzureProvider =
+      providerNameLower === "azure" ||
+      providerNameLower.includes("azure") ||
+      providerNameLower.includes("apim")
+    const useMaxCompletionTokens =
+      isAzureProvider && this.modelId.includes("gpt-5") && !this.modelId.includes("gpt-5-chat")
     return {
       args: {
         // model id:
@@ -145,7 +154,9 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV3 {
         user: compatibleOptions.user,
 
         // standardized settings:
-        max_tokens: maxOutputTokens,
+        ...(useMaxCompletionTokens
+          ? { max_completion_tokens: maxOutputTokens }
+          : { max_tokens: maxOutputTokens }),
         temperature,
         top_p: topP,
         frequency_penalty: frequencyPenalty,

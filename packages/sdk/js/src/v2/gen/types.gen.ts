@@ -126,15 +126,45 @@ export type EventPermissionReplied = {
 export type SessionStatus =
   | {
       type: "idle"
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
   | {
       type: "retry"
       attempt: number
       message: string
       next: number
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
   | {
       type: "busy"
+      provider?: {
+        [key: string]: {
+          account?: string
+          cooldownUntil?: number
+          lastStatusCode?: number
+          lastErrorAt?: number
+          successCount?: number
+          failureCount?: number
+        }
+      }
     }
 
 export type EventSessionStatus = {
@@ -1310,6 +1340,12 @@ export type ProviderConfig = {
           [key: string]: unknown | boolean | undefined
         }
       }
+      runtime?: {
+        system_prompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+        disable_local_tools?: boolean
+        max_active_tools?: number
+        tool_priority?: Array<string>
+      }
     }
   }
   whitelist?: Array<string>
@@ -1692,6 +1728,12 @@ export type Model = {
       | {
           field: "reasoning_content" | "reasoning_details"
         }
+  }
+  runtime: {
+    systemPrompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+    disableLocalTools?: boolean
+    maxActiveTools?: number
+    toolPriority?: Array<string>
   }
   cost: {
     input: number
@@ -4271,6 +4313,12 @@ export type ProviderListResponses = {
               [key: string]: unknown
             }
           }
+          runtime?: {
+            system_prompt?: "anthropic" | "beast" | "codex" | "gemini" | "groq" | "qwen" | "trinity"
+            disable_local_tools?: boolean
+            max_active_tools?: number
+            tool_priority?: Array<string>
+          }
         }
       }
     }>
@@ -4389,6 +4437,138 @@ export type ProviderOauthCallbackResponses = {
 }
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
+
+export type AuthUsageData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/auth/usage"
+}
+
+export type AuthUsageErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type AuthUsageError = AuthUsageErrors[keyof AuthUsageErrors]
+
+export type AuthUsageResponses = {
+  /**
+   * Usage information per provider and account
+   */
+  200: AuthUsage
+}
+
+export type AuthUsageResponse = AuthUsageResponses[keyof AuthUsageResponses]
+
+export type AuthSetActiveData = {
+  body?: {
+    providerID: string
+    recordID: string
+    namespace?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/auth/active"
+}
+
+export type AuthSetActiveErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type AuthSetActiveError = AuthSetActiveErrors[keyof AuthSetActiveErrors]
+
+export type AuthSetActiveResponses = {
+  /**
+   * Active account switched with updated usage
+   */
+  200: {
+    success: boolean
+    anthropicUsage?: unknown
+  }
+}
+
+export type AuthSetActiveResponse = AuthSetActiveResponses[keyof AuthSetActiveResponses]
+
+export type AuthDeleteAccountData = {
+  body?: {
+    providerID: string
+    recordID: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/auth/account"
+}
+
+export type AuthDeleteAccountErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type AuthDeleteAccountError = AuthDeleteAccountErrors[keyof AuthDeleteAccountErrors]
+
+export type AuthDeleteAccountResponses = {
+  /**
+   * Account deleted
+   */
+  200: {
+    success: boolean
+    remaining: number
+  }
+}
+
+export type AuthDeleteAccountResponse = AuthDeleteAccountResponses[keyof AuthDeleteAccountResponses]
+
+export type AuthUpdateAccountData = {
+  body?: {
+    providerID: string
+    recordID: string
+    namespace?: string
+    label?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/auth/account"
+}
+
+export type AuthUpdateAccountErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type AuthUpdateAccountError = AuthUpdateAccountErrors[keyof AuthUpdateAccountErrors]
+
+export type AuthUpdateAccountResponses = {
+  /**
+   * Account updated
+   */
+  200: {
+    success: boolean
+  }
+}
+
+export type AuthUpdateAccountResponse = AuthUpdateAccountResponses[keyof AuthUpdateAccountResponses]
 
 export type FindTextData = {
   body?: never

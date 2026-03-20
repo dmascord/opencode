@@ -207,9 +207,6 @@ export namespace Server {
                 },
               },
             },
-          }),
-          async (c) => {
-            return c.json(await Auth.usage())
           },
         }),
         async (c) => {

@@ -2,6 +2,7 @@ import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { Log } from "../util/log"
 import { Installation } from "../installation"
 import { Auth, OAUTH_DUMMY_KEY } from "../auth"
+import { getOAuthRecordID } from "../auth/context"
 import os from "os"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelID, ProviderID } from "@/provider/schema"
@@ -109,6 +110,29 @@ interface TokenResponse {
   access_token: string
   refresh_token: string
   expires_in?: number
+}
+
+function summarizeCodexHeaders(response: Response) {
+  const keys = [
+    "x-oai-request-id",
+    "x-codex-plan-type",
+    "x-codex-active-limit",
+    "x-codex-primary-used-percent",
+    "x-codex-primary-reset-at",
+    "x-codex-primary-reset-after-seconds",
+    "x-codex-secondary-used-percent",
+    "x-codex-secondary-reset-at",
+    "x-codex-secondary-reset-after-seconds",
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+    "retry-after",
+  ]
+  const summary: Record<string, string> = {}
+  for (const key of keys) {
+    const value = response.headers.get(key)
+    if (value) summary[key] = value
+  }
+  return summary
 }
 
 async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
@@ -372,8 +396,8 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
           "gpt-5.1-codex-mini",
           "gpt-5.2",
           "gpt-5.2-codex",
-          "gpt-5.3-codex",
           "gpt-5.4",
+          "gpt-5.3-codex",
           "gpt-5.4-mini",
         ])
         for (const modelId of Object.keys(provider.models)) {
@@ -412,12 +436,34 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
 
             // Cast to include accountId field
             const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
+            const recordID = getOAuthRecordID("openai")
 
             // Check if token needs refresh
             if (!currentAuth.access || currentAuth.expires < Date.now()) {
-              log.info("refreshing codex access token")
-              const tokens = await refreshAccessToken(currentAuth.refresh)
+              log.info("refreshing codex access token", {
+                recordID,
+                accountId: authWithAccount.accountId,
+                expires: currentAuth.expires,
+                expiredByMs: Date.now() - currentAuth.expires,
+              })
+              let tokens: TokenResponse
+              try {
+                tokens = await refreshAccessToken(currentAuth.refresh)
+              } catch (error) {
+                log.warn("codex access token refresh failed", {
+                  recordID,
+                  accountId: authWithAccount.accountId,
+                  error,
+                })
+                throw error
+              }
               const newAccountId = extractAccountId(tokens) || authWithAccount.accountId
+              log.info("codex access token refresh succeeded", {
+                recordID,
+                previousAccountId: authWithAccount.accountId,
+                newAccountId,
+                expiresIn: tokens.expires_in,
+              })
               await input.client.auth.set({
                 path: { id: "openai" },
                 body: {
@@ -465,11 +511,26 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
               parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
                 ? new URL(CODEX_API_ENDPOINT)
                 : parsed
+            log.info("dispatching codex oauth request", {
+              recordID,
+              accountId: authWithAccount.accountId,
+              url: url.toString(),
+              method: init?.method ?? (requestInput instanceof Request ? requestInput.method : "GET"),
+            })
 
-            return fetch(url, {
+            const response = await fetch(url, {
               ...init,
               headers,
             })
+            if (!response.ok) {
+              log.warn("codex oauth request failed", {
+                recordID,
+                accountId: authWithAccount.accountId,
+                statusCode: response.status,
+                headers: summarizeCodexHeaders(response),
+              })
+            }
+            return response
           },
         }
       },
