@@ -35,6 +35,7 @@ interface CodexUsage {
 
 interface MiniMaxUsage {
   fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+  _error?: string
 }
 
 interface AccountUsage {
@@ -49,6 +50,18 @@ interface ProviderUsageData {
   anthropicUsage?: AnthropicUsage
   codexUsage?: CodexUsage
   minimaxUsage?: MiniMaxUsage
+}
+
+interface ProviderQuotaDisplay {
+  provider: string
+  subtitle?: string
+  lines: {
+    key: string
+    label: string
+    utilization: number
+    resetsAt?: string
+    color: string
+  }[]
 }
 
 interface SessionContextTabProps {
@@ -417,7 +430,158 @@ function MiniMaxUsageSection() {
           No MiniMax API key configured. Set MINIMAX_API_KEY.
         </div>
       </Show>
+
+      <Show when={!usage.loading && usage()?._error}>
+        <div class="text-11-regular text-text-warning p-2 rounded bg-surface-base">
+          {usage()?._error}
+        </div>
+      </Show>
     </div>
+  )
+}
+
+function ProviderQuotaSection(props: { providerID?: string }) {
+  const globalSDK = useGlobalSDK()
+
+  const [usage, { refetch }] = createResource(async () => {
+    const result = await globalSDK.client.auth.usage({})
+    return result.data as Record<string, ProviderUsageData>
+  })
+
+  const quota = createMemo<ProviderQuotaDisplay | null>(() => {
+    const providerID = props.providerID
+    const data = usage()
+    if (!providerID || !data) return null
+
+    if (providerID === "anthropic") {
+      const anthropic = data["anthropic"]?.anthropicUsage
+      if (!anthropic) return null
+
+      const lines: ProviderQuotaDisplay["lines"] = []
+      if (anthropic.fiveHour) {
+        lines.push({
+          key: "5h",
+          label: "Current session",
+          utilization: anthropic.fiveHour.utilization,
+          resetsAt: anthropic.fiveHour.resetsAt,
+          color: getUsageColor(anthropic.fiveHour.utilization),
+        })
+      }
+      if (anthropic.sevenDay) {
+        lines.push({
+          key: "7d",
+          label: "Current week (all models)",
+          utilization: anthropic.sevenDay.utilization,
+          resetsAt: anthropic.sevenDay.resetsAt,
+          color: getUsageColor(anthropic.sevenDay.utilization),
+        })
+      }
+      if (!lines.length) return null
+
+      return {
+        provider: "Anthropic / Claude",
+        subtitle: "Claude Pro/Max",
+        lines,
+      }
+    }
+
+    if (providerID === "openai" || providerID === "codex") {
+      const codex = data["codex"]?.codexUsage
+      if (!codex) return null
+
+      const lines: ProviderQuotaDisplay["lines"] = []
+      if (codex.fiveHour) {
+        lines.push({
+          key: "5h",
+          label: "Codex (5h)",
+          utilization: codex.fiveHour.utilization,
+          resetsAt: codex.fiveHour.resetsAt,
+          color: getUsageColor(codex.fiveHour.utilization),
+        })
+      }
+      if (codex.sevenDay) {
+        lines.push({
+          key: "7d",
+          label: "Codex (7d)",
+          utilization: codex.sevenDay.utilization,
+          resetsAt: codex.sevenDay.resetsAt,
+          color: getUsageColor(codex.sevenDay.utilization),
+        })
+      }
+      if (!lines.length) return null
+
+      return {
+        provider: "GPT 5.4 (OAuth)",
+        subtitle: codex.planType ? `Plan: ${codex.planType}` : undefined,
+        lines,
+      }
+    }
+
+    if (providerID === "minimax" || providerID === "minimax-1") {
+      const minimax = data["minimax"]?.minimaxUsage
+      if (!minimax?.fiveHour) return null
+
+      return {
+        provider: "MiniMax",
+        lines: [
+          {
+            key: "5h",
+            label: `5-Hour Window (${minimax.fiveHour.remainingCredits}/${minimax.fiveHour.totalCredits} credits left)`,
+            utilization: minimax.fiveHour.utilization,
+            resetsAt: minimax.fiveHour.resetsAt,
+            color: getUsageColor(minimax.fiveHour.utilization),
+          },
+        ],
+      }
+    }
+
+    return null
+  })
+
+  return (
+    <Show when={usage.loading || quota()}>
+      <div class="flex flex-col gap-2">
+        <div class="text-12-regular text-text-weak">Provider Quota</div>
+
+        <Show when={usage.loading}>
+          <div class="flex items-center justify-center py-4">
+            <Spinner class="size-4" />
+          </div>
+        </Show>
+
+        <Show when={!usage.loading && quota()}>
+          {(data) => (
+            <>
+              <div class="text-11-regular text-text-muted">{data().provider}</div>
+              <Show when={data().subtitle}>
+                <div class="text-11-regular text-text-weaker">{data().subtitle}</div>
+              </Show>
+              <For each={data().lines}>
+                {(line) => (
+                  <div class="flex flex-col gap-1">
+                    <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                      <div class="size-2 rounded-sm" style={{ "background-color": line.color }} />
+                      <div>{line.label}</div>
+                      <div class="text-text-weaker">{line.utilization}% used ({Math.max(0, 100 - line.utilization)}% remaining)</div>
+                      <Show when={line.resetsAt}>
+                        <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+              <button
+                type="button"
+                class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start mt-1"
+                onClick={() => refetch()}
+              >
+                Refresh
+              </button>
+            </>
+          )}
+        </Show>
+      </div>
+    </Show>
   )
 }
 
@@ -702,16 +866,7 @@ export function SessionContextTab() {
           </div>
         </Show>
 
-        {/* Anthropic Rate Limits - only show when provider is Anthropic */}
-        <Show when={ctx()?.provider?.id === "anthropic"}>
-          <AnthropicUsageSection />
-        </Show>
-
-        {/* Codex Rate Limits - show when available */}
-        <CodexUsageSection />
-
-        {/* MiniMax Rate Limits - show when available */}
-        <MiniMaxUsageSection />
+        <ProviderQuotaSection providerID={ctx()?.provider?.id} />
 
         <Show when={systemPrompt()}>
           {(prompt) => (

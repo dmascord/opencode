@@ -1,5 +1,5 @@
 import { useSync } from "@tui/context/sync"
-import { createMemo, For, Show, Switch, Match, createSignal, onMount } from "solid-js"
+import { createEffect, createMemo, For, Show, Switch, Match, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useTheme } from "../../context/theme"
 import { Locale } from "@/util/locale"
@@ -16,18 +16,42 @@ import { TodoItem } from "../../component/todo-item"
 
 type ProviderQuota = {
   _error?: string
-  codex?: {
+  anthropic?: {
     accounts: unknown[]
+    anthropicUsage?: {
+      fiveHour?: { utilization: number; resetsAt?: string }
+      sevenDay?: { utilization: number; resetsAt?: string }
+      sevenDaySonnet?: { utilization: number; resetsAt?: string }
+    }
+  }
+  codex?: {
+    accounts: Array<{ id: string; label?: string; isActive?: boolean }>
     codexUsage?: {
       fiveHour?: { utilization: number; resetsAt?: string }
       sevenDay?: { utilization: number; resetsAt?: string }
       planType?: string
+      source?: string
+      account?: {
+        id?: string
+        label?: string
+        email?: string
+      }
+      raw?: {
+        email?: string
+        rate_limit?: {
+          primary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+          secondary_window?: { used_percent: number; reset_at: number; limit_window_seconds: number }
+        }
+        plan_type?: string
+      }
+      _error?: string
     }
   }
   minimax?: {
     accounts: unknown[]
     minimaxUsage?: {
       fiveHour?: { utilization: number; resetsAt?: string; remainingCredits: number; totalCredits: number }
+      _error?: string
     }
   }
   openrouter?: {
@@ -75,6 +99,7 @@ type ProviderQuota = {
 
 function getTrackedQuotaProvider(model?: { providerID: string; modelID: string }) {
   if (!model) return
+  if (model.providerID === "anthropic") return "anthropic" as const
   if (model.providerID === "openai") return "codex" as const
   if (model.providerID.startsWith("minimax") || model.modelID.includes("minimax")) return "minimax" as const
   if (model.providerID === "openrouter") return "openrouter" as const
@@ -82,6 +107,10 @@ function getTrackedQuotaProvider(model?: { providerID: string; modelID: string }
   if (model.providerID === "google" || model.providerID === "google-vertex") return "gemini" as const
   if (model.providerID === "github-copilot" || model.providerID === "github-copilot-enterprise") return "github-copilot" as const
   return
+}
+
+function hasLiveQuotaProvider(provider?: ReturnType<typeof getTrackedQuotaProvider>) {
+  return provider === "anthropic" || provider === "codex" || provider === "minimax" || provider === "openrouter" || provider === "github-copilot"
 }
 
 function formatResetTime(resetsAt?: string): string {
@@ -95,6 +124,12 @@ function formatResetTime(resetsAt?: string): string {
   const minutes = totalMinutes % 60
   if (hours > 0) return `${hours}h ${minutes}m`
   return `${minutes}m`
+}
+
+function formatCodexAccount(quota?: ProviderQuota | null) {
+  const usage = quota?.codex?.codexUsage
+  const active = quota?.codex?.accounts.find((item) => item.isActive)
+  return usage?.account?.email ?? usage?.raw?.email ?? usage?.account?.label ?? active?.label ?? usage?.account?.id ?? active?.id
 }
 
 export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
@@ -149,38 +184,85 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const kv = useKV()
   const sdk = useSDK()
   const local = useLocal()
+  const selectedModel = createMemo(() => local.model.current())
+  const selectedQuotaProvider = createMemo(() => getTrackedQuotaProvider(selectedModel()))
   
   // Provider quota state
   const [quota, setQuota] = createSignal<ProviderQuota | null>(null)
   const [quotaLoading, setQuotaLoading] = createSignal(false)
-  
-  // Fetch quota on mount
-  onMount(async () => {
+  let quotaRefreshInFlight = false
+
+  const refreshQuota = async () => {
     if (!sdk) {
       setQuota({ _error: "SDK not available" })
       return
     }
+    if (quotaRefreshInFlight) return
+
+    quotaRefreshInFlight = true
     setQuotaLoading(true)
+
     try {
-       const result = await sdk.client.auth.usage({})
-       if (result.data) {
-         setQuota(result.data as ProviderQuota)
-       } else if (result.error) {
-         setQuota({ _error: result.error instanceof Error ? result.error.message : String(result.error) })
-       }
+      const result = await sdk.client.auth.usage2({})
+      if (result.data) {
+        setQuota(result.data as ProviderQuota)
+      } else if (result.error) {
+        const errMsg = result.error instanceof Error ? result.error.message : String(result.error)
+        // On rate limit (403/429), preserve previous quota data if available
+        if ((errMsg.includes("403") || errMsg.includes("429")) && quota()) {
+          // Just refresh the loading state, don't clear existing data
+        } else {
+          setQuota({ _error: errMsg })
+        }
+      }
     } catch (e) {
-      // Store error for display
-      setQuota({ _error: e instanceof Error ? e.message : String(e) })
+      const errMsg = e instanceof Error ? e.message : String(e)
+      // On rate limit, preserve previous quota data if available
+      if ((errMsg.includes("403") || errMsg.includes("429")) && quota()) {
+        // Just refresh the loading state, don't clear existing data
+      } else {
+        setQuota({ _error: errMsg })
+      }
+    } finally {
+      quotaRefreshInFlight = false
+      setQuotaLoading(false)
     }
-    setQuotaLoading(false)
+  }
+
+  let quotaIdleCycles = 0
+  
+  // Fetch quota on mount and periodically while idle.
+  onMount(() => {
+    void refreshQuota()
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+
+    const scheduleNext = () => {
+      clearTimeout(timeout)
+      const provider = selectedQuotaProvider()
+      if (!hasLiveQuotaProvider(provider)) return
+
+      const delay = quotaIdleCycles >= 3 ? 60_000 : 30_000
+      timeout = setTimeout(async () => {
+        quotaIdleCycles += 1
+        await refreshQuota()
+        scheduleNext()
+      }, delay)
+    }
+
+    createEffect(() => {
+      selectedQuotaProvider()
+      quotaIdleCycles = 0
+      scheduleNext()
+    })
+
+    onCleanup(() => clearTimeout(timeout))
   })
   
   const hasProviders = createMemo(() =>
     sync.data.provider.some((x) => x.id !== "opencode" || Object.values(x.models).some((y) => y.cost?.input !== 0)),
   )
   const gettingStartedDismissed = createMemo(() => kv.get("dismissed_getting_started", false))
-  const selectedModel = createMemo(() => local.model.current())
-  const selectedQuotaProvider = createMemo(() => getTrackedQuotaProvider(selectedModel()))
   const selectedQuotaLabel = createMemo(() => {
     const selected = selectedModel()
     if (!selected) return
@@ -231,9 +313,14 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
             {/* Provider Quota Section */}
             <Show when={quota() && selectedQuotaProvider()}>
               <box>
-                <text fg={theme.text}>
-                  <b>Provider Quota</b>
-                </text>
+                <box flexDirection="row" justifyContent="space-between">
+                  <text fg={theme.text}>
+                    <b>Provider Quota</b>
+                  </text>
+                  <Show when={quotaLoading()}>
+                    <text fg={theme.textMuted}>◷</text>
+                  </Show>
+                </box>
                 <Show when={selectedQuotaLabel()}>
                   <text fg={theme.textMuted}>{selectedQuotaLabel()}</text>
                 </Show>
@@ -243,13 +330,46 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
 
                 <Show when={!quota()!._error && selectedQuotaProvider() === "codex" && quota()?.codex?.codexUsage}>
-                  <text fg={theme.text}>Codex (5h): {
-                    quota()!.codex!.codexUsage!.fiveHour 
-                      ? `${quota()!.codex!.codexUsage!.fiveHour!.utilization}% used`
-                      : "N/A"
-                  }</text>
+                  <Show when={formatCodexAccount(quota())}>
+                    {(account) => <text fg={theme.textMuted}>Account: {account()}</text>}
+                  </Show>
+                  <Show when={quota()?.codex?.codexUsage?.planType}>
+                    {(plan) => <text fg={theme.textMuted}>Plan: {plan()}</text>}
+                  </Show>
+                  <Show when={quota()?.codex?.codexUsage?.source}>
+                    {(source) => <text fg={theme.textMuted}>Source: {source()}</text>}
+                  </Show>
+                  <text fg={theme.text}>Codex (5h): {quota()!.codex!.codexUsage!.fiveHour ? `${quota()!.codex!.codexUsage!.fiveHour!.utilization}% used` : "N/A"}</text>
+                  <Show when={quota()?.codex?.codexUsage?.fiveHour?.resetsAt}>
+                    <text fg={theme.textMuted}>Resets in: {formatResetTime(quota()!.codex!.codexUsage!.fiveHour!.resetsAt)}</text>
+                  </Show>
                   <Show when={quota()?.codex?.codexUsage?.sevenDay}>
                     <text fg={theme.textMuted}>Codex (7d): {quota()!.codex!.codexUsage!.sevenDay!.utilization}% used</text>
+                  </Show>
+                  <Show when={quota()?.codex?.codexUsage?.sevenDay?.resetsAt}>
+                    <text fg={theme.textMuted}>7d resets in: {formatResetTime(quota()!.codex!.codexUsage!.sevenDay!.resetsAt)}</text>
+                  </Show>
+                  <Show when={quota()?.codex?.codexUsage?._error}>
+                    {(err) => <text fg={theme.warning}>{err()}</text>}
+                  </Show>
+                </Show>
+
+                <Show when={!quota()!._error && selectedQuotaProvider() === "anthropic" && quota()?.anthropic?.anthropicUsage}>
+                  <text fg={theme.text}>Claude Pro/Max</text>
+                  <Show when={quota()?.anthropic?.anthropicUsage?.fiveHour}>
+                    <text fg={theme.text}>
+                      Current session: {quota()!.anthropic!.anthropicUsage!.fiveHour!.utilization}% used ({Math.max(0, 100 - quota()!.anthropic!.anthropicUsage!.fiveHour!.utilization)}% remaining)
+                    </text>
+                  </Show>
+                  <Show when={quota()?.anthropic?.anthropicUsage?.sevenDay}>
+                    <text fg={theme.textMuted}>
+                      Current week: {quota()!.anthropic!.anthropicUsage!.sevenDay!.utilization}% used ({Math.max(0, 100 - quota()!.anthropic!.anthropicUsage!.sevenDay!.utilization)}% remaining)
+                    </text>
+                  </Show>
+                  <Show when={quota()?.anthropic?.anthropicUsage?.sevenDaySonnet}>
+                    <text fg={theme.textMuted}>
+                      Sonnet week: {quota()!.anthropic!.anthropicUsage!.sevenDaySonnet!.utilization}% used ({Math.max(0, 100 - quota()!.anthropic!.anthropicUsage!.sevenDaySonnet!.utilization)}% remaining)
+                    </text>
                   </Show>
                 </Show>
 
@@ -362,7 +482,8 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <Show
                   when={
                     !quota()!._error &&
-                    ((selectedQuotaProvider() === "codex" && !quota()?.codex?.codexUsage) ||
+                    ((selectedQuotaProvider() === "codex" && !quota()?.codex?.codexUsage?.raw && !quota()?.codex?.codexUsage?._error) ||
+                      (selectedQuotaProvider() === "anthropic" && !quota()?.anthropic?.anthropicUsage) ||
                       (selectedQuotaProvider() === "minimax" && !quota()?.minimax?.minimaxUsage?.fiveHour) ||
                       (selectedQuotaProvider() === "openrouter" && !quota()?.openrouter?.openrouterUsage) ||
                       (selectedQuotaProvider() === "cohere" && !quota()?.cohere?.cohereUsage) ||
@@ -372,12 +493,13 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 >
                   <text fg={theme.textMuted}>No live quota data for current model</text>
                 </Show>
+
+                <Show when={selectedQuotaProvider() === "minimax" && quota()?.minimax?.minimaxUsage?._error}>
+                  <text fg={theme.warning}>{quota()?.minimax?.minimaxUsage?._error}</text>
+                </Show>
               </box>
             </Show>
-            <Show when={quotaLoading()}>
-              <text fg={theme.textMuted}>Loading quota...</text>
-            </Show>
-            
+
             <Show when={mcpEntries().length > 0}>
               <box>
                 <box
