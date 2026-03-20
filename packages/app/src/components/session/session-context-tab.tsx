@@ -1,4 +1,4 @@
-import { createMemo, createEffect, on, onCleanup, For, Show } from "solid-js"
+import { createMemo, createEffect, createResource, on, onCleanup, For, Show } from "solid-js"
 import type { JSX } from "solid-js"
 import { useSync } from "@/context/sync"
 import { checksum } from "@opencode-ai/util/encode"
@@ -10,10 +10,12 @@ import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { File } from "@opencode-ai/ui/file"
 import { Markdown } from "@opencode-ai/ui/markdown"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
+import { Spinner } from "@opencode-ai/ui/spinner"
 import type { Message, Part, UserMessage } from "@opencode-ai/sdk/v2/client"
 import { useLanguage } from "@/context/language"
 import { useProviders } from "@/hooks/use-providers"
 import { useSessionLayout } from "@/pages/session/session-layout"
+import { useGlobalSDK } from "@/context/global-sdk"
 import { getSessionContextMetrics } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import { createSessionContextFormatter } from "./session-context-format"
@@ -84,6 +86,178 @@ function RawMessage(props: {
         </div>
       </Accordion.Content>
     </Accordion.Item>
+  )
+}
+
+type QuotaUsage = {
+  accounts?: Array<{ id: string; label?: string; isActive?: boolean }>
+  anthropicUsage?: {
+    fiveHour?: { utilization: number; resetsAt?: string }
+    sevenDay?: { utilization: number; resetsAt?: string }
+    sevenDaySonnet?: { utilization: number; resetsAt?: string }
+  }
+  codexUsage?: {
+    fiveHour?: { utilization: number; resetsAt?: string }
+    sevenDay?: { utilization: number; resetsAt?: string }
+    planType?: string
+  }
+  minimaxUsage?: {
+    fiveHour?: { utilization: number; resetsAt?: string; remainingCredits?: number; totalCredits?: number }
+  }
+}
+
+type QuotaMap = Record<string, QuotaUsage>
+
+type QuotaLine = {
+  key: string
+  label: string
+  utilization: number
+  resetsAt?: string
+}
+
+function formatResetTime(resetAt?: string) {
+  if (!resetAt) return ''
+  const reset = new Date(resetAt)
+  const diffMs = reset.getTime() - Date.now()
+  if (diffMs <= 0) return 'now'
+  const totalMinutes = Math.floor(diffMs / (1000 * 60))
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
+
+function usageColor(utilization: number) {
+  if (utilization <= 50) return 'var(--syntax-success)'
+  if (utilization <= 80) return 'var(--syntax-warning)'
+  return 'var(--syntax-danger)'
+}
+
+function ProviderQuotaSection(props: { providerID?: string }) {
+  const globalSDK = useGlobalSDK()
+  const [usage, actions] = createResource(async () => {
+    const result = await globalSDK.client.auth.usage({})
+    return (result.data ?? {}) as QuotaMap
+  })
+
+  const quota = createMemo(() => {
+    const providerID = props.providerID
+    const data = usage()
+    if (!providerID || !data) return
+
+    if (providerID === 'anthropic') {
+      const item = data.anthropic
+      const limits: QuotaLine[] = []
+      if (item?.anthropicUsage?.fiveHour)
+        limits.push({ key: '5h', label: 'Current session', ...item.anthropicUsage.fiveHour })
+      if (item?.anthropicUsage?.sevenDay)
+        limits.push({ key: '7d', label: 'Current week', ...item.anthropicUsage.sevenDay })
+      if (item?.anthropicUsage?.sevenDaySonnet)
+        limits.push({ key: '7d-sonnet', label: 'Sonnet week', ...item.anthropicUsage.sevenDaySonnet })
+      if (!limits.length) return
+      return { title: 'Anthropic / Claude', subtitle: 'Claude Pro/Max', lines: limits, accounts: item.accounts ?? [] }
+    }
+
+    if (providerID === 'openai' || providerID === 'codex') {
+      const item = data.codex
+      const limits: QuotaLine[] = []
+      if (item?.codexUsage?.fiveHour)
+        limits.push({ key: '5h', label: 'Codex (5h)', ...item.codexUsage.fiveHour })
+      if (item?.codexUsage?.sevenDay)
+        limits.push({ key: '7d', label: 'Codex (7d)', ...item.codexUsage.sevenDay })
+      if (!limits.length) return
+      return { title: 'OpenAI Codex', subtitle: item.codexUsage?.planType, lines: limits, accounts: item.accounts ?? [] }
+    }
+
+    if (providerID.startsWith('minimax')) {
+      const item = data.minimax
+      if (!item?.minimaxUsage?.fiveHour) return
+      const limit = item.minimaxUsage.fiveHour
+      const credits = limit.remainingCredits !== undefined && limit.totalCredits !== undefined
+        ? ` (${limit.remainingCredits}/${limit.totalCredits} credits)`
+        : ''
+      return {
+        title: 'MiniMax',
+        lines: [{ key: '5h', label: `5-Hour Window${credits}`, utilization: limit.utilization, resetsAt: limit.resetsAt }],
+        accounts: item.accounts ?? [],
+      }
+    }
+  })
+
+  const switchAccount = async (recordID: string) => {
+    const providerID = props.providerID
+    if (!providerID) return
+    await globalSDK.client.auth.setActive({ providerID, recordID })
+    await actions.refetch()
+  }
+
+  return (
+    <Show when={usage.loading || quota()}>
+      <div class="flex flex-col gap-2">
+        <div class="text-12-regular text-text-weak">Provider Quota</div>
+        <Show when={usage.loading}>
+          <div class="flex items-center justify-center py-3">
+            <Spinner class="size-4" />
+          </div>
+        </Show>
+        <Show when={quota()}>
+          {(data) => (
+            <>
+              <div class="text-11-regular text-text-muted">{data().title}</div>
+              <Show when={data().subtitle}>
+                {(subtitle) => <div class="text-11-regular text-text-weaker">{subtitle()}</div>}
+              </Show>
+              <For each={data().lines}>
+                {(line) => (
+                  <div class="flex flex-col gap-1">
+                    <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden">
+                      <div
+                        class="h-full transition-all"
+                        style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
+                      />
+                    </div>
+                    <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                      <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
+                      <div>{line.label}</div>
+                      <div class="text-text-weaker">{line.utilization}% used</div>
+                      <Show when={line.resetsAt}>
+                        <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+              <Show when={props.providerID === 'anthropic' && (data().accounts?.length ?? 0) > 1}>
+                <div class="flex flex-wrap gap-1 pt-1">
+                  <For each={data().accounts}>
+                    {(account, index) => (
+                      <button
+                        type="button"
+                        class="px-2 py-1 rounded border text-11-medium transition-colors"
+                        classList={{
+                          'border-fill-success-base bg-fill-success-ghost text-fill-success-base': !!account.isActive,
+                          'border-border-base bg-surface-base text-text-muted hover:text-text-base': !account.isActive,
+                        }}
+                        onClick={() => !account.isActive && switchAccount(account.id)}
+                      >
+                        {(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+              <button
+                type="button"
+                class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start"
+                onClick={() => actions.refetch()}
+              >
+                Refresh
+              </button>
+            </>
+          )}
+        </Show>
+      </div>
+    </Show>
   )
 }
 
@@ -171,6 +345,8 @@ export function SessionContextTab() {
     if (!c) return "—"
     return c.modelLabel
   })
+
+  const quotaProviderID = createMemo(() => ctx()?.message.providerID)
 
   const breakdown = createMemo(
     on(
@@ -313,6 +489,8 @@ export function SessionContextTab() {
             <div class="hidden text-11-regular text-text-weaker">{language.t("context.breakdown.note")}</div>
           </div>
         </Show>
+
+        <ProviderQuotaSection providerID={quotaProviderID()} />
 
         <Show when={systemPrompt()}>
           {(prompt) => (
