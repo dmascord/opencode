@@ -1221,18 +1221,18 @@ export namespace Provider {
       if (auth) {
         const options = await plugin.auth.loader(
           () => Auth.get(providerID) as any,
-          providers[plugin.auth.provider] ?? database[plugin.auth.provider],
+          providers[providerID] ?? database[providerID],
         )
         const opts = options ?? {}
-        const patch: Partial<Info> = providers[plugin.auth.provider]
+        const patch: Partial<Info> = providers[providerID]
           ? { options: opts }
           : { source: "custom", options: opts }
-        mergeProvider(plugin.auth.provider, patch)
+        mergeProvider(providerID, patch)
       }
 
       // If this is github-copilot plugin, also register for github-copilot-enterprise if auth exists
-      if (providerID === "github-copilot") {
-        const enterpriseProviderID = "github-copilot-enterprise"
+      if (providerID === ProviderID.githubCopilot) {
+        const enterpriseProviderID = ProviderID.make("github-copilot-enterprise")
         if (!disabled.has(enterpriseProviderID)) {
           const enterpriseAuth = await Auth.get(enterpriseProviderID)
           if (enterpriseAuth) {

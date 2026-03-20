@@ -15,13 +15,14 @@ import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { Effect } from "effect"
-
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
   code: "ZlibError"
   errno: number
   path: string
 }
+import { Question } from "@/question"
+import { PermissionNext } from "@/permission"
 
 export namespace MessageV2 {
   export function isMedia(mime: string) {
@@ -998,6 +999,8 @@ export namespace MessageV2 {
           },
           { cause: e },
         ).toObject()
+      case e instanceof Question.RejectedError || e instanceof PermissionNext.RejectedError || e instanceof PermissionNext.CorrectedError:
+        return new NamedError.Unknown({ message: e.message }, { cause: e }).toObject()
       case e instanceof Error:
         if (e.name === "TimeoutError" || /timed out/i.test(e.message)) {
           return new MessageV2.APIError(

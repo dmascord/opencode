@@ -1687,6 +1687,8 @@ export type WellKnownAuth = {
 
 export type Auth = OAuth | ApiAuth | WellKnownAuth
 
+export type AuthUsage = Record<string, unknown>
+
 export type NotFoundError = {
   name: "NotFoundError"
   data: {

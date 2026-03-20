@@ -396,31 +396,36 @@ export namespace Auth {
 
   export async function all(): Promise<Record<string, Info>> {
     const store = await loadStoreFile()
-    return Object.fromEntries(
-      Object.entries(store.providers).flatMap(([providerID, entry]) => {
-        if (entry.type === "api") return [[providerID, { type: "api", key: entry.key } satisfies Info]]
-        if (entry.type === "wellknown")
-          return [[providerID, { type: "wellknown", key: entry.key, token: entry.token } satisfies Info]]
+    const result: Record<string, Info> = {}
+    for (const [providerID, entry] of Object.entries(store.providers)) {
+      if (entry.type === "api") {
+        result[providerID] = { type: "api", key: entry.key }
+        continue
+      }
+      if (entry.type === "wellknown") {
+        result[providerID] = { type: "wellknown", key: entry.key, token: entry.token }
+        continue
+      }
 
-        const namespace = "default"
-        const contextID = getOAuthRecordID(providerID)
-        const active = contextID ?? entry.active[namespace]
-        const ordered = recordIDsForNamespace(entry, namespace)
-        const recordID = active && ordered.includes(active) ? active : ordered[0]
-        if (!recordID) return []
+      const namespace = "default"
+      const contextID = getOAuthRecordID(providerID)
+      const active = contextID ?? entry.active[namespace]
+      const ordered = recordIDsForNamespace(entry, namespace)
+      const recordID = active && ordered.includes(active) ? active : ordered[0]
+      if (!recordID) continue
 
-        const record = findOAuthRecord(entry, recordID)
-        if (!record) return []
-        return [[providerID, {
-          type: "oauth",
-          refresh: record.refresh,
-          access: record.access,
-          expires: record.expires,
-          accountId: record.accountId,
-          enterpriseUrl: record.enterpriseUrl,
-        } satisfies Info]]
-      }),
-    )
+      const record = findOAuthRecord(entry, recordID)
+      if (!record) continue
+      result[providerID] = {
+        type: "oauth",
+        refresh: record.refresh,
+        access: record.access,
+        expires: record.expires,
+        accountId: record.accountId,
+        enterpriseUrl: record.enterpriseUrl,
+      }
+    }
+    return result
   }
 
   export async function get(providerID: string): Promise<Info | undefined> {

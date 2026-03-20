@@ -1,7 +1,6 @@
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import { Auth } from "@/auth"
-import { Instance } from "@/project/instance"
 import { InstanceState } from "@/effect/instance-state"
 import { makeRuntime } from "@/effect/run-service"
 import { SessionID } from "./schema"
@@ -141,11 +140,9 @@ export namespace SessionStatus {
 
   export async function set(sessionID: SessionID, status: Info) {
     await runPromise((svc) => svc.set(sessionID, status))
-    if (sessionID === Instance.ID) {
-      Bus.publish(Event.Status, {
-        sessionID: "__global__",
-        status: await global(),
-      })
-    }
+    Bus.publish(Event.Status, {
+      sessionID: SessionID.make("__global__"),
+      status: await global(),
+    })
   }
 }

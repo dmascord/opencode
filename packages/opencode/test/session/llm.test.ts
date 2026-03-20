@@ -1142,8 +1142,8 @@ describe("session.llm.stream", () => {
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        const resolved = await Provider.getModel("groq", "compound")
-        const sessionID = "session-test-groq-compound"
+        const resolved = await Provider.getModel(ProviderID.make("groq"), ModelID.make("compound"))
+        const sessionID = SessionID.make("session-test-groq-compound")
         const agent = {
           name: "test",
           mode: "primary",
@@ -1152,12 +1152,12 @@ describe("session.llm.stream", () => {
         } satisfies Agent.Info
 
         const user = {
-          id: "user-groq-1",
+          id: MessageID.make("user-groq-1"),
           sessionID,
           role: "user",
           time: { created: Date.now() },
           agent: agent.name,
-          model: { providerID: "groq", modelID: resolved.id },
+          model: { providerID: ProviderID.make("groq"), modelID: resolved.id },
         } satisfies MessageV2.User
 
         const stream = await LLM.stream({

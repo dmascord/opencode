@@ -24,6 +24,7 @@ export namespace SystemPrompt {
     codex: PROMPT_CODEX,
     gemini: PROMPT_GEMINI,
     groq: PROMPT_GROQ,
+    qwen: PROMPT_ANTHROPIC,
     trinity: PROMPT_TRINITY,
   } as const
 

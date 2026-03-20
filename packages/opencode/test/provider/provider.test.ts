@@ -96,9 +96,9 @@ test("provider loaded from oauth auth store", async () => {
     directory: tmp.path,
     fn: async () => {
       const providers = await Provider.list()
-      expect(providers["anthropic"]).toBeDefined()
-      expect(providers["anthropic"].source).toBe("custom")
-      expect(providers["anthropic"].options.headers["anthropic-beta"]).toBeDefined()
+      expect(providers[ProviderID.anthropic]).toBeDefined()
+      expect(providers[ProviderID.anthropic].source).toBe("custom")
+      expect(providers[ProviderID.anthropic].options.headers["anthropic-beta"]).toBeDefined()
     },
   })
 })

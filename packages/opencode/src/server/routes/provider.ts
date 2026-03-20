@@ -305,6 +305,4 @@ export const ProviderRoutes = lazy(() =>
         return c.json({ success })
       },
     )
-    // Browser session routes for auto-relogin
-    ),
 )
