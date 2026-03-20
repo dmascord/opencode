@@ -934,6 +934,15 @@ export namespace Provider {
 
   export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/Provider") {}
 
+  type ProviderConfigValue = NonNullable<Awaited<ReturnType<typeof Config.get>>["provider"]>[string]
+  type ProviderOverrideValue = {
+    name?: string
+    env?: string[]
+    npm?: string
+    api?: string
+    options?: Record<string, unknown>
+    models?: Record<string, any>
+  }
   function defaultRuntimePolicy(model: Pick<Model, "providerID" | "id" | "api">): Model["runtime"] {
     return {
       ...(PROVIDER_RUNTIME_POLICY[model.providerID as keyof typeof PROVIDER_RUNTIME_POLICY] ?? {}),
@@ -1064,7 +1073,10 @@ export namespace Provider {
           const dep = {
             auth: (id: string) => auth.get(id).pipe(Effect.orDie),
             config: () => config.get(),
-    const configProviders = Object.entries(config.provider ?? {})
+          }
+
+          const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES) as Array<[string, ProviderOverrideValue]>
+          const configProviders = Object.entries(cfg.provider ?? {}) as Array<[string, ProviderConfigValue]>
 
     function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
       const existing = providers[providerID]
@@ -1159,7 +1171,7 @@ export namespace Provider {
         }
         const merged = mergeDeep(ProviderTransform.variants(parsedModel), model.variants ?? {})
         parsedModel.variants = mapValues(
-          pickBy(merged, (v) => !v.disabled),
+          pickBy(merged, (v) => !(v as { disabled?: boolean }).disabled),
           (v) => omit(v, ["disabled"]),
         )
         parsed.models[modelID] = parsedModel

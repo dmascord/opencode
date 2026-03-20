@@ -1,3 +1,7 @@
+import type { Provider } from "./provider"
+
+const policy = <T extends Provider.Model["runtime"]>(value: T) => value
+
 export const PROVIDER_RUNTIME_POLICY = {
   apim: {
     maxActiveTools: 128,
@@ -20,25 +24,23 @@ export const PROVIDER_RUNTIME_POLICY = {
       "batch",
       "lsp",
       "planexit",
-    ],
+    ] as string[],
   },
   groq: {
     systemPrompt: "groq",
     maxActiveTools: 4,
-    toolPriority: ["bash", "read", "glob", "grep"],
+    toolPriority: ["bash", "read", "glob", "grep"] as string[],
   },
-} as const
+} satisfies Record<string, Provider.Model["runtime"]>
 
 export const MODEL_RUNTIME_POLICY = {
-  "groq/compound": {
+  "groq/compound": policy({
     disableLocalTools: true,
-    maxActiveTools: undefined,
-  },
-  "groq/compound-mini": {
+  }),
+  "groq/compound-mini": policy({
     disableLocalTools: true,
-    maxActiveTools: undefined,
-  },
-  "groq/llama-3.1-8b-instant": {
+  }),
+  "groq/llama-3.1-8b-instant": policy({
     maxActiveTools: 1,
-  },
-} as const
+  }),
+} satisfies Record<string, Provider.Model["runtime"]>
