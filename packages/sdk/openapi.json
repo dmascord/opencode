@@ -11603,6 +11603,9 @@
           "accountId": {
             "type": "string"
           },
+          "email": {
+            "type": "string"
+          },
           "enterpriseUrl": {
             "type": "string"
           }

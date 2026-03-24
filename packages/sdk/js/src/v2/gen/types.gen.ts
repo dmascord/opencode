@@ -56,6 +56,7 @@ export type EventServerInstanceDisposed = {
 
 export type EventServerConnected = {
   type: "server.connected"
+
   properties: {
     [key: string]: unknown
   }
@@ -1362,7 +1363,7 @@ export type ProviderConfig = {
      */
     setCacheKey?: boolean
     /**
-     * Timeout in milliseconds for requests to this provider. Default is 300000 (5 minutes). Set to false to disable timeout.
+     * Timeout in milliseconds for requests to this provider. Default is 60000 (1 minute). Set to false to disable timeout.
      */
     timeout?: number | false
     /**
@@ -1668,6 +1669,7 @@ export type OAuth = {
   access: string
   expires: number
   accountId?: string
+  email?: string
   enterpriseUrl?: string
 }
 
@@ -1686,8 +1688,6 @@ export type WellKnownAuth = {
 }
 
 export type Auth = OAuth | ApiAuth | WellKnownAuth
-
-export type AuthUsage = Record<string, unknown>
 
 export type NotFoundError = {
   name: "NotFoundError"
@@ -1963,6 +1963,8 @@ export type ProviderAuthAuthorization = {
   method: "auto" | "code"
   instructions: string
 }
+
+export type AuthUsage = unknown
 
 export type Symbol = {
   name: string
