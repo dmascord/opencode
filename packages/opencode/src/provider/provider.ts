@@ -61,7 +61,8 @@ import { PROVIDER_OVERRIDES } from "./overrides"
 
 export namespace Provider {
   const log = Log.create({ service: "provider" })
-  const DEFAULT_PROVIDER_TIMEOUT_MS = 60_000
+  const DEFAULT_PROVIDER_TIMEOUT_MS = 900_000
+  const DEFAULT_CHUNK_TIMEOUT_MS = 90_000
 
   function shouldUseCopilotResponsesApi(modelID: string): boolean {
     const match = /^gpt-(\d+)/.exec(modelID)
@@ -1396,8 +1397,9 @@ export namespace Provider {
           if (existing) return existing
 
           const customFetch = options["fetch"]
-          const chunkTimeout = options["chunkTimeout"]
+          const chunkTimeout = options["chunkTimeout"] ?? DEFAULT_CHUNK_TIMEOUT_MS
           delete options["chunkTimeout"]
+          if (options["timeout"] === undefined) options["timeout"] = DEFAULT_PROVIDER_TIMEOUT_MS
 
           options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
             const fetchFn = customFetch ?? fetch
