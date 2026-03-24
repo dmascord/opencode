@@ -19,11 +19,10 @@ import { type ToolDefinition } from "./tool.js"
 export * from "./tool.js"
 
 export type ProviderContext = {
-  source: "env" | "config" | "custom" | "api"
-  info: Provider
-  options: Record<string, any>
-}
-
+    source: "env" | "config" | "custom" | "api";
+    info: Provider;
+    options: Record<string, any>;
+};
 export type PluginInput = {
   client: ReturnType<typeof createOpencodeClient>
   project: Project
