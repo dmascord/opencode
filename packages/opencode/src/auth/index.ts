@@ -24,6 +24,7 @@ export namespace Auth {
     access: Schema.String,
     expires: Schema.Number,
     accountId: Schema.optional(Schema.String),
+    email: Schema.optional(Schema.String),
     enterpriseUrl: Schema.optional(Schema.String),
   }) {}
 
@@ -133,6 +134,7 @@ export namespace Auth {
       namespace: z.string().default("default"),
       label: z.string().optional(),
       accountId: z.string().optional(),
+      email: z.string().optional(),
       enterpriseUrl: z.string().optional(),
       refresh: z.string(),
       access: z.string(),
@@ -181,6 +183,8 @@ export namespace Auth {
     })
     .strict()
   type StoreFile = z.infer<typeof StoreFile>
+  const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+  const OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
 
   function toMeta(record: OAuthRecord): OAuthRecordMeta {
     const { refresh: _refresh, access: _access, expires: _expires, ...meta } = record
@@ -196,6 +200,24 @@ export namespace Auth {
       }
     } catch {
       return
+    }
+  }
+
+  async function refreshOpenAIToken(refresh: string) {
+    const response = await fetch(`${OPENAI_OAUTH_ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refresh,
+        client_id: OPENAI_OAUTH_CLIENT_ID,
+      }).toString(),
+    })
+    if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`)
+    return (await response.json()) as {
+      refresh_token: string
+      access_token: string
+      expires_in?: number
     }
   }
 
@@ -364,6 +386,14 @@ export namespace Auth {
     return provider.records.find((record) => record.id === recordID)
   }
 
+  function pickRecord(providerID: string, provider: OAuthProvider, namespace: string, preferred?: string) {
+    const recordID = availableRecordID(provider, namespace, preferred ?? getOAuthRecordID(providerID) ?? provider.active[namespace])
+    if (!recordID) return
+    const record = provider.records.find((item) => item.id === recordID && item.namespace === namespace)
+    if (!record) return
+    return { recordID, record }
+  }
+
   function normalizeOrder(ids: string[], order: string[]): string[] {
     const ordered: string[] = []
     for (const id of order) {
@@ -381,6 +411,25 @@ export namespace Auth {
     return normalizeOrder(ids, order)
   }
 
+  function availableRecordID(
+    provider: OAuthProvider,
+    namespace: string,
+    preferred?: string,
+  ): string | undefined {
+    const ordered = recordIDsForNamespace(provider, namespace)
+    const now = Date.now()
+    const ready = (id?: string) => {
+      if (!id) return false
+      const record = provider.records.find((item) => item.id === id && item.namespace === namespace)
+      if (!record) return false
+      const cooldown = record.health.cooldownUntil
+      return !cooldown || cooldown <= now
+    }
+
+    if (ready(preferred)) return preferred
+    return ordered.find((id) => ready(id)) ?? preferred ?? ordered[0]
+  }
+
   async function findOAuthRecordIDByRefreshToken(input: {
     providerID: string
     namespace: string
@@ -395,7 +444,9 @@ export namespace Auth {
   }
 
   export async function all(): Promise<Record<string, Info>> {
+    log.debug("Auth.all called")
     const store = await loadStoreFile()
+    log.debug("Auth.all loaded store", { providers: Object.keys(store.providers) })
     const result: Record<string, Info> = {}
     for (const [providerID, entry] of Object.entries(store.providers)) {
       if (entry.type === "api") {
@@ -408,23 +459,29 @@ export namespace Auth {
       }
 
       const namespace = "default"
-      const contextID = getOAuthRecordID(providerID)
-      const active = contextID ?? entry.active[namespace]
-      const ordered = recordIDsForNamespace(entry, namespace)
-      const recordID = active && ordered.includes(active) ? active : ordered[0]
-      if (!recordID) continue
-
-      const record = findOAuthRecord(entry, recordID)
-      if (!record) continue
+      const choice = pickRecord(providerID, entry, namespace)
+      log.debug("Auth.all processing oauth provider", {
+        providerID,
+        contextID: getOAuthRecordID(providerID),
+        recordID: choice?.recordID,
+      })
+      if (!choice) {
+        log.debug("Auth.all no recordID found", { providerID, active: entry.active[namespace] })
+        continue
+      }
+      const { recordID, record } = choice
+      log.debug("Auth.all found record", { providerID, recordID, hasEmail: !!record.email, expires: record.expires })
       result[providerID] = {
         type: "oauth",
         refresh: record.refresh,
         access: record.access,
         expires: record.expires,
         accountId: record.accountId,
+        email: record.email,
         enterpriseUrl: record.enterpriseUrl,
       }
     }
+    log.debug("Auth.all returning", { providers: Object.keys(result) })
     return result
   }
 
@@ -433,23 +490,37 @@ export namespace Auth {
   }
 
   export async function set(key: string, info: Info) {
+    const norm = key.replace(/\/+$/, "")
+    log.debug("Auth.set called", { key, norm, type: info.type })
     if (info.type === "oauth") {
-      await addOAuth(key, info)
+      log.debug("Auth.set calling addOAuth", { key, norm, hasEmail: !!info.email, expires: info.expires })
+      await addOAuth(norm, info)
+      log.debug("Auth.set addOAuth complete", { key, norm })
       return
     }
 
     await updateStore((store) => {
-      store.providers[key] = info.type === "api" ? { type: "api", key: info.key } : { type: "wellknown", key: info.key, token: info.token }
+      // Normalize key and clean up trailing slash variant
+      if (norm !== key) {
+        delete store.providers[key]
+      }
+      delete store.providers[norm + "/"]
+      store.providers[norm] = info.type === "api" ? { type: "api", key: info.key } : { type: "wellknown", key: info.key, token: info.token }
       return { value: undefined, changed: true }
     })
+    log.debug("Auth.set complete", { key, norm })
   }
 
   export async function remove(key: string) {
+    const norm = key.replace(/\/+$/, "")
+    log.debug("Auth.remove called", { key, norm })
     return updateStore((store) => {
-      const existing = store.providers[key]
+      const existing = store.providers[key] ?? store.providers[norm]
       if (!existing) return { value: undefined, changed: false }
 
       delete store.providers[key]
+      delete store.providers[norm]
+      delete store.providers[norm + "/"]
       return { value: undefined, changed: true }
     })
   }
@@ -458,18 +529,21 @@ export namespace Auth {
     providerID: string,
     input: Omit<z.infer<typeof Oauth>, "type"> & { namespace?: string; label?: string },
   ) {
+    const normProviderID = providerID.replace(/\/+$/, "")
     const namespace = (input.namespace ?? "default").trim() || "default"
+    log.debug("Auth.addOAuth called", { providerID: normProviderID, namespace, hasEmail: !!input.email, expires: input.expires })
     return updateStore(async (store) => {
-      const provider = ensureOAuthProvider(store, providerID)
+      const provider = ensureOAuthProvider(store, normProviderID)
       const now = Date.now()
       const existingRecordID = await findOAuthRecordIDByRefreshToken({
-        providerID,
+        providerID: normProviderID,
         namespace,
         refresh: input.refresh,
         provider,
       })
 
       if (existingRecordID) {
+        log.debug("Auth.addOAuth updating existing record", { providerID: normProviderID, existingRecordID })
         const existing = findOAuthRecord(provider, existingRecordID)
         if (existing) {
           existing.refresh = input.refresh
@@ -477,8 +551,10 @@ export namespace Auth {
           existing.expires = input.expires
           existing.updatedAt = now
           if (input.accountId !== undefined) existing.accountId = input.accountId
+          if (input.email !== undefined) existing.email = input.email
           if (input.enterpriseUrl !== undefined) existing.enterpriseUrl = input.enterpriseUrl
           if (input.label) existing.label = input.label
+          log.debug("Auth.addOAuth updated fields", { providerID: normProviderID, existingRecordID, email: existing.email })
         }
         const order = provider.order[namespace] ?? []
         if (!order.includes(existingRecordID)) {
@@ -486,16 +562,18 @@ export namespace Auth {
         }
         provider.active[namespace] = existingRecordID
 
-        return { value: { providerID, namespace, recordID: existingRecordID }, changed: true }
+        return { value: { providerID: normProviderID, namespace, recordID: existingRecordID }, changed: true }
       }
 
       const recordID = ulid()
+      log.debug("Auth.addOAuth creating new record", { providerID: normProviderID, recordID })
 
       provider.records.push({
         id: recordID,
         namespace,
         label: input.label ?? "default",
         accountId: input.accountId,
+        email: input.email,
         enterpriseUrl: input.enterpriseUrl,
         refresh: input.refresh,
         access: input.access,
@@ -508,7 +586,7 @@ export namespace Auth {
       provider.order[namespace] = [...(provider.order[namespace] ?? []), recordID]
       provider.active[namespace] = recordID
 
-      return { value: { providerID, namespace, recordID }, changed: true }
+      return { value: { providerID: normProviderID, namespace, recordID }, changed: true }
     })
   }
 
@@ -574,6 +652,7 @@ export namespace Auth {
 
         const record = findOAuthRecord(provider, input.recordID)
         if (!record) return { value: undefined, changed: false }
+        const namespace = record.namespace
 
         const now = Date.now()
         const prevCooldown =
@@ -589,6 +668,18 @@ export namespace Auth {
           failureCount: record.health.failureCount + (input.ok ? 0 : 1),
         }
         record.updatedAt = now
+
+        if (!input.ok) {
+          const order = recordIDsForNamespace(provider, namespace)
+          provider.order[namespace] = order.filter((id) => id !== input.recordID).concat(input.recordID)
+          const next = availableRecordID(
+            provider,
+            namespace,
+            provider.order[namespace].find((id) => id !== input.recordID),
+          )
+          provider.active[namespace] = next ?? input.recordID
+        }
+
         return { value: undefined, changed: true }
       })
     }
@@ -613,6 +704,7 @@ export namespace Auth {
       Array<{
         id: string
         label?: string
+        email?: string
         isActive: boolean
         health: {
           successCount: number
@@ -626,23 +718,14 @@ export namespace Auth {
       const provider = store.providers[providerID]
       if (!provider || provider.type !== "oauth") return []
 
-      const orderedIDs = recordIDsForNamespace(provider, namespace)
-      const now = Date.now()
-      // Use explicitly set active account if it exists, otherwise fall back to first non-cooldown
-      const activeID =
-        provider.active[namespace] ??
-        orderedIDs.find((id) => {
-          const record = provider.records.find((r) => r.id === id)
-          const cooldownUntil = record?.health.cooldownUntil
-          return !cooldownUntil || cooldownUntil <= now
-        }) ??
-        orderedIDs[0]
+      const activeID = pickRecord(providerID, provider, namespace)?.recordID
 
       return provider.records
         .filter((record) => record.namespace === namespace)
         .map((record) => ({
           id: record.id,
           label: record.label,
+          email: record.email,
           isActive: record.id === activeID,
           health: {
             successCount: record.health.successCount,
@@ -651,6 +734,24 @@ export namespace Auth {
             cooldownUntil: record.health.cooldownUntil,
           },
         }))
+    }
+
+    export async function pick(providerID: string, namespace = "default", preferred?: string) {
+      const store = await loadStoreFile()
+      const provider = store.providers[providerID]
+      if (!provider || provider.type !== "oauth") return
+      const choice = pickRecord(providerID, provider, namespace, preferred)
+      if (!choice) return
+      return {
+        id: choice.record.id,
+        namespace: choice.record.namespace,
+        label: choice.record.label,
+        accountId: choice.record.accountId,
+        email: choice.record.email,
+        refresh: choice.record.refresh,
+        access: choice.record.access,
+        expires: choice.record.expires,
+      }
     }
 
     export async function setActive(providerID: string, namespace: string, recordID: string): Promise<boolean> {
@@ -748,20 +849,8 @@ export namespace Auth {
       const provider = store.providers[providerID]
       if (!provider || provider.type !== "oauth") return null
 
-      const orderedIDs = recordIDsForNamespace(provider, namespace)
-      const now = Date.now()
-      // Use explicit recordID if provided, otherwise use active account
-      const activeID =
-        recordID ??
-        provider.active[namespace] ??
-        orderedIDs.find((id) => {
-          const rec = provider.records.find((r) => r.id === id)
-          const cooldownUntil = rec?.health.cooldownUntil
-          return !cooldownUntil || cooldownUntil <= now
-        }) ??
-        orderedIDs[0]
-      const record = provider.records.find((r) => r.id === activeID && r.namespace === namespace)
-      if (!record?.access) return null
+      const choice = pickRecord(providerID, provider, namespace, recordID)
+      if (!choice?.record.access) return null
 
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 5000)
@@ -772,7 +861,7 @@ export namespace Auth {
           headers: {
             Accept: "application/json",
             "Content-Type": "application/json",
-            Authorization: `Bearer ${record.access}`,
+            Authorization: `Bearer ${choice.record.access}`,
             "anthropic-beta": "oauth-2025-04-20",
           },
           signal: controller.signal,
@@ -804,7 +893,7 @@ export namespace Auth {
       }
     }
 
-    export async function fetchCodexUsage(): Promise<{
+    export async function fetchCodexUsage(recordID?: string): Promise<{
       fiveHour?: { utilization: number; resetsAt?: string }
       sevenDay?: { utilization: number; resetsAt?: string }
       planType?: string
@@ -827,6 +916,8 @@ export namespace Auth {
       let accessToken: string | undefined
       let accountId: string | undefined
       let tokenSource: string | undefined
+      let chosen: Awaited<ReturnType<typeof Auth.OAuthPool.pick>> | undefined
+      let refresh: string | undefined
       let account:
         | {
             id?: string
@@ -840,20 +931,27 @@ export namespace Auth {
         const store = await loadStoreFile()
         const openaiProvider = store.providers?.openai
         if (openaiProvider?.type === "oauth") {
-          const namespace = "default"
-          const activeID = openaiProvider.active?.[namespace]
-          const orderedIDs = openaiProvider.order?.[namespace] || []
-          const recordID = activeID && orderedIDs.includes(activeID) ? activeID : orderedIDs[0]
-          const record = openaiProvider.records?.find((r) => r.id === recordID)
-          if (record?.access) {
-            accessToken = record.access
-            accountId = record.accountId
+          const choice = pickRecord("openai", openaiProvider, "default", recordID)
+          if (choice?.record.access) {
+            chosen = {
+              id: choice.record.id,
+              namespace: choice.record.namespace,
+              label: choice.record.label,
+              accountId: choice.record.accountId,
+              email: choice.record.email,
+              refresh: choice.record.refresh,
+              access: choice.record.access,
+              expires: choice.record.expires,
+            }
+            refresh = choice.record.refresh
+            accessToken = choice.record.access
+            accountId = choice.record.accountId
             tokenSource = "opencode-oauth-pool"
-            const meta = toMeta(record)
+            const meta = toMeta(choice.record)
             account = {
               id: meta.accountId,
               label: meta.label,
-              email: claims(record.access)?.email,
+              email: claims(choice.record.access)?.email,
             }
           }
         }
@@ -892,11 +990,35 @@ export namespace Auth {
         }
       }
 
+      if (chosen && refresh && (!accessToken || chosen.expires < Date.now())) {
+        try {
+          const tokens = await refreshOpenAIToken(refresh)
+          await Auth.OAuthPool.updateRecord("openai", chosen.id, "default", {
+            refresh: tokens.refresh_token,
+            access: tokens.access_token,
+            expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+          })
+          refresh = tokens.refresh_token
+          accessToken = tokens.access_token
+          account = {
+            id: chosen.accountId,
+            label: chosen.label,
+            email: claims(tokens.access_token)?.email ?? chosen.email,
+          }
+        } catch (error) {
+          return {
+            source: tokenSource,
+            account,
+            _error: error instanceof Error ? error.message : "Token refresh failed",
+          }
+        }
+      }
+
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 5000)
 
       try {
-        const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+        let response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
           method: "GET",
           headers: {
             Accept: "application/json",
@@ -906,6 +1028,40 @@ export namespace Auth {
           },
           signal: controller.signal,
         })
+
+        if (response.status === 401 && chosen && refresh) {
+          try {
+            const tokens = await refreshOpenAIToken(refresh)
+            await Auth.OAuthPool.updateRecord("openai", chosen.id, "default", {
+              refresh: tokens.refresh_token,
+              access: tokens.access_token,
+              expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+            })
+            refresh = tokens.refresh_token
+            accessToken = tokens.access_token
+            account = {
+              id: chosen.accountId,
+              label: chosen.label,
+              email: claims(tokens.access_token)?.email ?? chosen.email,
+            }
+            response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+              method: "GET",
+              headers: {
+                Accept: "application/json",
+                Authorization: `Bearer ${tokens.access_token}`,
+                "ChatGPT-Account-Id": accountId || "",
+                "User-Agent": "opencode/1.0",
+              },
+              signal: controller.signal,
+            })
+          } catch (error) {
+            return {
+              source: tokenSource,
+              account,
+              _error: error instanceof Error ? error.message : "Token refresh failed",
+            }
+          }
+        }
 
         if (!response.ok) {
           return {
@@ -1140,16 +1296,7 @@ export namespace Auth {
         const provider = store.providers["github-copilot"]
         if (!provider || provider.type !== "oauth") return null
 
-        const orderedIDs = recordIDsForNamespace(provider, "default")
-        const now = Date.now()
-        const activeID =
-          provider.active["default"] ??
-          orderedIDs.find((id) => {
-            const rec = provider.records.find((r) => r.id === id)
-            const cooldownUntil = rec?.health.cooldownUntil
-            return !cooldownUntil || cooldownUntil <= now
-          }) ??
-          orderedIDs[0]
+        const activeID = availableRecordID(provider, "default", provider.active["default"])
         const record = provider.records.find((r) => r.id === activeID && r.namespace === "default")
         if (!record?.access) return null
 
@@ -1307,8 +1454,14 @@ export namespace Auth {
 
     const codexUsage = await Auth.OAuthPool.fetchCodexUsage()
     if (codexUsage) {
+      const accounts = await Auth.OAuthPool.getUsage("openai")
       result.codex = {
-        accounts: await Auth.OAuthPool.getUsage("openai"),
+        accounts: await Promise.all(
+          accounts.map(async (account) => ({
+            ...account,
+            codexUsage: (await Auth.OAuthPool.fetchCodexUsage(account.id)) ?? undefined,
+          })),
+        ),
         codexUsage,
       }
     }

@@ -1,4 +1,4 @@
-import { createMemo, createEffect, createResource, on, onCleanup, For, Show } from "solid-js"
+import { createMemo, createEffect, createResource, createSignal, on, onCleanup, For, Show } from "solid-js"
 import type { JSX } from "solid-js"
 import { useSync } from "@/context/sync"
 import { checksum } from "@opencode-ai/util/encode"
@@ -90,7 +90,16 @@ function RawMessage(props: {
 }
 
 type QuotaUsage = {
-  accounts?: Array<{ id: string; label?: string; isActive?: boolean }>
+  accounts?: Array<{
+    id: string
+    label?: string
+    isActive?: boolean
+    codexUsage?: {
+      fiveHour?: { utilization: number; resetsAt?: string }
+      sevenDay?: { utilization: number; resetsAt?: string }
+      planType?: string
+    }
+  }>
   anthropicUsage?: {
     fiveHour?: { utilization: number; resetsAt?: string }
     sevenDay?: { utilization: number; resetsAt?: string }
@@ -115,6 +124,16 @@ type QuotaLine = {
   resetsAt?: string
 }
 
+function codexLines(input?: {
+  fiveHour?: { utilization: number; resetsAt?: string }
+  sevenDay?: { utilization: number; resetsAt?: string }
+}) {
+  const lines: QuotaLine[] = []
+  if (input?.fiveHour) lines.push({ key: '5h', label: 'Codex (5h)', ...input.fiveHour })
+  if (input?.sevenDay) lines.push({ key: '7d', label: 'Codex (7d)', ...input.sevenDay })
+  return lines
+}
+
 function formatResetTime(resetAt?: string) {
   if (!resetAt) return ''
   const reset = new Date(resetAt)
@@ -133,11 +152,40 @@ function usageColor(utilization: number) {
   return 'var(--syntax-danger)'
 }
 
+const POLL_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
+
 function ProviderQuotaSection(props: { providerID?: string }) {
   const globalSDK = useGlobalSDK()
-  const [usage, actions] = createResource(async () => {
-    const result = await globalSDK.client.auth.usage({})
-    return (result.data ?? {}) as QuotaMap
+  const [rateLimitedUntil, setRateLimitedUntil] = createSignal<number>(0)
+  const [lastSuccessfulFetch, setLastSuccessfulFetch] = createSignal<number>(0)
+
+  const fetcher = async () => {
+    try {
+      const result = await globalSDK.client.auth.usage({})
+      setLastSuccessfulFetch(Date.now())
+      setRateLimitedUntil(0) // Clear any previous rate limit
+      return (result.data ?? {}) as QuotaMap
+    } catch (err) {
+      // If rate limited (429) or server error (5xx), back off for a minute
+      const status = (err as any)?.status
+      if (status === 429 || (status >= 500 && status < 600)) {
+        setRateLimitedUntil(Date.now() + 60_000)
+      }
+      throw err
+    }
+  }
+
+  const [usage, actions] = createResource(fetcher)
+
+  // Set up polling
+  createEffect(() => {
+    const interval = setInterval(() => {
+      if (Date.now() >= rateLimitedUntil()) {
+        actions.refetch()
+      }
+    }, 30_000) // Check every 30 seconds
+
+    onCleanup(() => clearInterval(interval))
   })
 
   const quota = createMemo(() => {
@@ -160,11 +208,7 @@ function ProviderQuotaSection(props: { providerID?: string }) {
 
     if (providerID === 'openai' || providerID === 'codex') {
       const item = data.codex
-      const limits: QuotaLine[] = []
-      if (item?.codexUsage?.fiveHour)
-        limits.push({ key: '5h', label: 'Codex (5h)', ...item.codexUsage.fiveHour })
-      if (item?.codexUsage?.sevenDay)
-        limits.push({ key: '7d', label: 'Codex (7d)', ...item.codexUsage.sevenDay })
+      const limits = codexLines(item?.codexUsage)
       if (!limits.length) return
       return { title: 'OpenAI Codex', subtitle: item.codexUsage?.planType, lines: limits, accounts: item.accounts ?? [] }
     }
@@ -227,21 +271,60 @@ function ProviderQuotaSection(props: { providerID?: string }) {
                   </div>
                 )}
               </For>
-              <Show when={props.providerID === 'anthropic' && (data().accounts?.length ?? 0) > 1}>
-                <div class="flex flex-wrap gap-1 pt-1">
+              <Show when={(data().accounts?.length ?? 0) > 1}>
+                <div class="flex flex-col gap-2 pt-1">
+                  <div class="flex flex-wrap gap-1">
+                    <For each={data().accounts}>
+                      {(account, index) => (
+                        <button
+                          type="button"
+                          class="px-2 py-1 rounded border text-11-medium transition-colors"
+                          classList={{
+                            'border-fill-success-base bg-fill-success-ghost text-fill-success-base': !!account.isActive,
+                            'border-border-base bg-surface-base text-text-muted hover:text-text-base': !account.isActive,
+                          }}
+                          onClick={() => !account.isActive && switchAccount(account.id)}
+                        >
+                          {(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}
+                        </button>
+                      )}
+                    </For>
+                  </div>
                   <For each={data().accounts}>
                     {(account, index) => (
-                      <button
-                        type="button"
-                        class="px-2 py-1 rounded border text-11-medium transition-colors"
-                        classList={{
-                          'border-fill-success-base bg-fill-success-ghost text-fill-success-base': !!account.isActive,
-                          'border-border-base bg-surface-base text-text-muted hover:text-text-base': !account.isActive,
-                        }}
-                        onClick={() => !account.isActive && switchAccount(account.id)}
-                      >
-                        {(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}
-                      </button>
+                      <Show when={codexLines(account.codexUsage).length}>
+                        <div class="flex flex-col gap-1 rounded border border-border-base bg-surface-base p-2">
+                          <div class="flex items-center gap-2 text-11-medium text-text-weak">
+                            <div>{(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}</div>
+                            <Show when={account.isActive}>
+                              <div class="text-fill-success-base">active</div>
+                            </Show>
+                            <Show when={account.codexUsage?.planType}>
+                              {(plan) => <div class="text-text-weaker ml-auto">{plan()}</div>}
+                            </Show>
+                          </div>
+                          <For each={codexLines(account.codexUsage)}>
+                            {(line) => (
+                              <div class="flex flex-col gap-1">
+                                <div class="h-2 w-full rounded-full bg-background-base overflow-hidden">
+                                  <div
+                                    class="h-full transition-all"
+                                    style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
+                                  />
+                                </div>
+                                <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                                  <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
+                                  <div>{line.label}</div>
+                                  <div class="text-text-weaker">{line.utilization}% used</div>
+                                  <Show when={line.resetsAt}>
+                                    <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
+                                  </Show>
+                                </div>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
                     )}
                   </For>
                 </div>
