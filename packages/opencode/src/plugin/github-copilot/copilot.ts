@@ -212,7 +212,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
-                scope: "read:user",
+                scope: "read:user read:org",
               }),
             })
 

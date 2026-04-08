@@ -2,18 +2,15 @@ import path from "path"
 import fs from "fs/promises"
 import z from "zod"
 import { ulid } from "ulid"
-import { Effect, Layer, Record, Result, Schema, ServiceMap } from "effect"
+import { Effect, Layer, Schema, ServiceMap } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import { zod } from "@/util/effect-zod"
 import { Global } from "../global"
-import { AppFileSystem } from "../filesystem"
 import { Filesystem } from "../util/filesystem"
 import { getOAuthRecordID } from "./context"
 import { Log } from "../util/log"
 
 export const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
-
-const file = path.join(Global.Path.data, "auth.json")
 
 const fail = (message: string) => (cause: unknown) => new Auth.AuthError({ message, cause })
 
@@ -58,44 +55,23 @@ export namespace Auth {
 
   export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/Auth") {}
 
+  function lift<A extends readonly unknown[], R>(name: string, fn: (...args: A) => Promise<R>, message: string) {
+    return Effect.fn(name)((...args: A) => Effect.promise(() => fn(...args)).pipe(Effect.mapError(fail(message))))
+  }
+
   export const layer = Layer.effect(
     Service,
     Effect.gen(function* () {
-      const fsys = yield* AppFileSystem.Service
-      const decode = Schema.decodeUnknownOption(Info)
-
-      const all = Effect.fn("Auth.all")(function* () {
-        const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-        return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
-      })
-
-      const get = Effect.fn("Auth.get")(function* (providerID: string) {
-        return (yield* all())[providerID]
-      })
-
-      const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
-        const norm = key.replace(/\/+$/, "")
-        const data = yield* all()
-        if (norm !== key) delete data[key]
-        delete data[norm + "/"]
-        yield* fsys
-          .writeJson(file, { ...data, [norm]: info }, 0o600)
-          .pipe(Effect.mapError(fail("Failed to write auth data")))
-      })
-
-      const remove = Effect.fn("Auth.remove")(function* (key: string) {
-        const norm = key.replace(/\/+$/, "")
-        const data = yield* all()
-        delete data[key]
-        delete data[norm]
-        yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
-      })
+      const all = lift("Auth.all", readAllInfo, "Failed to load auth data")
+      const get = lift("Auth.get", readInfo, "Failed to load auth data")
+      const set = lift("Auth.set", writeInfo, "Failed to write auth data")
+      const remove = lift("Auth.remove", removeInfo, "Failed to write auth data")
 
       return Service.of({ get, all, set, remove })
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(AppFileSystem.defaultLayer))
+  export const defaultLayer = layer
 
   const { runPromise } = makeRuntime(Service, defaultLayer)
 
@@ -278,7 +254,7 @@ export namespace Auth {
     const parsed = StoreFile.safeParse(raw)
     if (parsed.success) return { store: parsed.data, needsWrite: false }
 
-    const legacyParsed = z.record(z.string(), Info).safeParse(raw)
+    const legacyParsed = z.record(z.string(), Info.zod).safeParse(raw)
     if (legacyParsed.success) {
       const now = Date.now()
       const next: StoreFile = { version: 2, providers: {} }
@@ -443,53 +419,53 @@ export namespace Auth {
     return undefined
   }
 
-  export async function all(): Promise<Record<string, Info>> {
+  function toInfo(providerID: string, entry: ProviderEntry): Info | undefined {
+    if (entry.type === "api") return { type: "api", key: entry.key }
+    if (entry.type === "wellknown") return { type: "wellknown", key: entry.key, token: entry.token }
+
+    const namespace = "default"
+    const choice = pickRecord(providerID, entry, namespace)
+    log.debug("Auth.all processing oauth provider", {
+      providerID,
+      contextID: getOAuthRecordID(providerID),
+      recordID: choice?.recordID,
+    })
+    if (!choice) {
+      log.debug("Auth.all no recordID found", { providerID, active: entry.active[namespace] })
+      return
+    }
+
+    const { recordID, record } = choice
+    log.debug("Auth.all found record", { providerID, recordID, hasEmail: !!record.email, expires: record.expires })
+    return {
+      type: "oauth",
+      refresh: record.refresh,
+      access: record.access,
+      expires: record.expires,
+      accountId: record.accountId,
+      email: record.email,
+      enterpriseUrl: record.enterpriseUrl,
+    }
+  }
+
+  async function readAllInfo(): Promise<Record<string, Info>> {
     log.debug("Auth.all called")
     const store = await loadStoreFile()
     log.debug("Auth.all loaded store", { providers: Object.keys(store.providers) })
     const result: Record<string, Info> = {}
     for (const [providerID, entry] of Object.entries(store.providers)) {
-      if (entry.type === "api") {
-        result[providerID] = { type: "api", key: entry.key }
-        continue
-      }
-      if (entry.type === "wellknown") {
-        result[providerID] = { type: "wellknown", key: entry.key, token: entry.token }
-        continue
-      }
-
-      const namespace = "default"
-      const choice = pickRecord(providerID, entry, namespace)
-      log.debug("Auth.all processing oauth provider", {
-        providerID,
-        contextID: getOAuthRecordID(providerID),
-        recordID: choice?.recordID,
-      })
-      if (!choice) {
-        log.debug("Auth.all no recordID found", { providerID, active: entry.active[namespace] })
-        continue
-      }
-      const { recordID, record } = choice
-      log.debug("Auth.all found record", { providerID, recordID, hasEmail: !!record.email, expires: record.expires })
-      result[providerID] = {
-        type: "oauth",
-        refresh: record.refresh,
-        access: record.access,
-        expires: record.expires,
-        accountId: record.accountId,
-        email: record.email,
-        enterpriseUrl: record.enterpriseUrl,
-      }
+      const info = toInfo(providerID, entry)
+      if (info) result[providerID] = info
     }
     log.debug("Auth.all returning", { providers: Object.keys(result) })
     return result
   }
 
-  export async function get(providerID: string): Promise<Info | undefined> {
-    return (await all())[providerID]
+  async function readInfo(providerID: string): Promise<Info | undefined> {
+    return (await readAllInfo())[providerID]
   }
 
-  export async function set(key: string, info: Info) {
+  async function writeInfo(key: string, info: Info) {
     const norm = key.replace(/\/+$/, "")
     log.debug("Auth.set called", { key, norm, type: info.type })
     if (info.type === "oauth") {
@@ -500,10 +476,7 @@ export namespace Auth {
     }
 
     await updateStore((store) => {
-      // Normalize key and clean up trailing slash variant
-      if (norm !== key) {
-        delete store.providers[key]
-      }
+      if (norm !== key) delete store.providers[key]
       delete store.providers[norm + "/"]
       store.providers[norm] = info.type === "api" ? { type: "api", key: info.key } : { type: "wellknown", key: info.key, token: info.token }
       return { value: undefined, changed: true }
@@ -511,7 +484,7 @@ export namespace Auth {
     log.debug("Auth.set complete", { key, norm })
   }
 
-  export async function remove(key: string) {
+  async function removeInfo(key: string) {
     const norm = key.replace(/\/+$/, "")
     log.debug("Auth.remove called", { key, norm })
     return updateStore((store) => {
@@ -525,9 +498,25 @@ export namespace Auth {
     })
   }
 
+  export async function all(): Promise<Record<string, Info>> {
+    return readAllInfo()
+  }
+
+  export async function get(providerID: string): Promise<Info | undefined> {
+    return readInfo(providerID)
+  }
+
+  export async function set(key: string, info: Info) {
+    return writeInfo(key, info)
+  }
+
+  export async function remove(key: string) {
+    return removeInfo(key)
+  }
+
   export async function addOAuth(
     providerID: string,
-    input: Omit<z.infer<typeof Oauth>, "type"> & { namespace?: string; label?: string },
+    input: Omit<Oauth, "type"> & { namespace?: string; label?: string },
   ) {
     const normProviderID = providerID.replace(/\/+$/, "")
     const namespace = (input.namespace ?? "default").trim() || "default"
@@ -1276,6 +1265,7 @@ export namespace Auth {
 
       export async function fetchGitHubCopilotUsage(): Promise<{
         hasAccess?: boolean
+        login?: string
         assignedDate?: string
         lastActivityDate?: string
         orgBillingBreakdown?: {
@@ -1304,7 +1294,6 @@ export namespace Auth {
         const timeout = setTimeout(() => controller.abort(), 5000)
 
         try {
-          // First, get user info
           const userResponse = await fetch("https://api.github.com/user", {
             method: "GET",
             headers: {
@@ -1317,31 +1306,12 @@ export namespace Auth {
 
           if (!userResponse.ok) return null
 
-          const userData = (await userResponse.json()) as {
-            login: string
-          }
-
+          const userData = (await userResponse.json()) as { login: string }
           const username = userData.login
-
-          // Get user's organizations
-          const orgsResponse = await fetch("https://api.github.com/user/orgs", {
-            method: "GET",
-            headers: {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${record.access}`,
-              "User-Agent": "opencode/1.0",
-            },
-            signal: controller.signal,
-          })
-
-          if (!orgsResponse.ok) return null
-
-          const orgsData = (await orgsResponse.json()) as Array<{
-            login: string
-          }>
 
           const result: {
             hasAccess?: boolean
+            login?: string
             assignedDate?: string
             lastActivityDate?: string
             orgBillingBreakdown?: {
@@ -1354,82 +1324,86 @@ export namespace Auth {
             }
             organizations?: Array<{ name: string; role: string }>
             statusMessage?: string
-          } = {}
+          } = { login: username }
 
-          // Try to find org with admin access and Copilot billing info
-          for (const org of orgsData) {
-            const billingResponse = await fetch(`https://api.github.com/orgs/${org.login}/copilot/billing`, {
-              method: "GET",
-              headers: {
-                Accept: "application/vnd.github+json",
-                Authorization: `Bearer ${record.access}`,
-                "User-Agent": "opencode/1.0",
-              },
-              signal: controller.signal,
-            }).catch(() => null)
+          // Orgs require read:org scope — try but don't fail if missing
+          const orgsResponse = await fetch("https://api.github.com/user/orgs", {
+            method: "GET",
+            headers: {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${record.access}`,
+              "User-Agent": "opencode/1.0",
+            },
+            signal: controller.signal,
+          }).catch(() => null)
 
-            if (billingResponse?.ok) {
-              const billingData = (await billingResponse.json()) as {
-                seat_breakdown: {
-                  total: number
-                  active_this_cycle: number
-                  inactive_this_cycle: number
-                  pending_invitation: number
-                  pending_cancellation: number
+          if (orgsResponse?.ok) {
+            const orgsData = (await orgsResponse.json()) as Array<{ login: string }>
+
+            // Try org billing (requires manage_billing:copilot or read:org admin)
+            for (const org of orgsData) {
+              const billing = await fetch(`https://api.github.com/orgs/${org.login}/copilot/billing`, {
+                method: "GET",
+                headers: {
+                  Accept: "application/vnd.github+json",
+                  Authorization: `Bearer ${record.access}`,
+                  "User-Agent": "opencode/1.0",
+                },
+                signal: controller.signal,
+              }).catch(() => null)
+
+              if (billing?.ok) {
+                const bd = (await billing.json()) as {
+                  seat_breakdown: {
+                    total: number
+                    active_this_cycle: number
+                    inactive_this_cycle: number
+                    pending_invitation: number
+                    pending_cancellation: number
+                  }
+                  plan_type: string
                 }
-                plan_type: string
-              }
-
-              result.orgBillingBreakdown = {
-                planType: billingData.plan_type,
-                totalSeats: billingData.seat_breakdown.total,
-                activeSeats: billingData.seat_breakdown.active_this_cycle,
-                inactiveSeats: billingData.seat_breakdown.inactive_this_cycle,
-                pendingInvitation: billingData.seat_breakdown.pending_invitation,
-                pendingCancellation: billingData.seat_breakdown.pending_cancellation,
-              }
-              break // Found admin access to org, use this data
-            }
-          }
-
-          // Try to find user's seat in any org
-          for (const org of orgsData) {
-            const seatsResponse = await fetch(`https://api.github.com/orgs/${org.login}/copilot/billing/seats`, {
-              method: "GET",
-              headers: {
-                Accept: "application/vnd.github+json",
-                Authorization: `Bearer ${record.access}`,
-                "User-Agent": "opencode/1.0",
-              },
-              signal: controller.signal,
-            }).catch(() => null)
-
-            if (seatsResponse?.ok) {
-              const seatsData = (await seatsResponse.json()) as {
-                seats: Array<{
-                  login: string
-                  assigned_date: string
-                  last_activity_date: string
-                }>
-              }
-
-              const userSeat = seatsData.seats.find((s) => s.login === username)
-              if (userSeat) {
-                result.hasAccess = true
-                result.assignedDate = userSeat.assigned_date
-                result.lastActivityDate = userSeat.last_activity_date
-                break // Found user's seat
+                result.orgBillingBreakdown = {
+                  planType: bd.plan_type,
+                  totalSeats: bd.seat_breakdown.total,
+                  activeSeats: bd.seat_breakdown.active_this_cycle,
+                  inactiveSeats: bd.seat_breakdown.inactive_this_cycle,
+                  pendingInvitation: bd.seat_breakdown.pending_invitation,
+                  pendingCancellation: bd.seat_breakdown.pending_cancellation,
+                }
+                break
               }
             }
+
+            // Try per-user seat lookup in each org
+            if (!result.hasAccess) {
+              for (const org of orgsData) {
+                const seat = await fetch(`https://api.github.com/orgs/${org.login}/members/${username}/copilot`, {
+                  method: "GET",
+                  headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: `Bearer ${record.access}`,
+                    "User-Agent": "opencode/1.0",
+                  },
+                  signal: controller.signal,
+                }).catch(() => null)
+
+                if (seat?.ok) {
+                  const sd = (await seat.json()) as { created_at: string; last_activity_at?: string | null }
+                  result.hasAccess = true
+                  result.assignedDate = sd.created_at
+                  result.lastActivityDate = sd.last_activity_at ?? undefined
+                  break
+                }
+              }
+            }
+
+            result.organizations = orgsData.map((org) => ({ name: org.login, role: "member" }))
           }
 
-          result.organizations = orgsData.map((org) => ({
-            name: org.login,
-            role: "member",
-          }))
-
+          // Token authenticated — Copilot is connected (even if org data unavailable)
           if (!result.hasAccess && !result.orgBillingBreakdown) {
-            result.statusMessage = "GitHub Copilot not directly accessible via API"
+            result.hasAccess = true
           }
 
           return result
