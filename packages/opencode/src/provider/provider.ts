@@ -944,6 +944,19 @@ export namespace Provider {
     options?: Record<string, unknown>
     models?: Record<string, any>
   }
+  type ConfigProviderValue = ProviderConfigValue | ProviderOverrideValue
+  type ConfigModelValue = NonNullable<ProviderConfigValue["models"]>[string] | NonNullable<ProviderOverrideValue["models"]>[string]
+
+  function isProviderAllowed(
+    providerID: ProviderID,
+    disabled: Set<string>,
+    enabled: Set<string> | null,
+  ) {
+    if (enabled && !enabled.has(providerID)) return false
+    if (disabled.has(providerID)) return false
+    return true
+  }
+
   function defaultRuntimePolicy(model: Pick<Model, "providerID" | "id" | "api">): Model["runtime"] {
     return {
       ...(PROVIDER_RUNTIME_POLICY[model.providerID as keyof typeof PROVIDER_RUNTIME_POLICY] ?? {}),
@@ -962,6 +975,137 @@ export namespace Provider {
       },
       (value) => value !== undefined,
     )
+  }
+
+  function mergeVariants(model: Model, variants?: ConfigModelValue["variants"]) {
+    const merged = mergeDeep(ProviderTransform.variants(model), variants ?? {})
+    return mapValues(
+      pickBy(merged, (value) => !(value as { disabled?: boolean }).disabled),
+      (value) => omit(value as Record<string, unknown>, ["disabled"]),
+    )
+  }
+
+  function fromConfiguredModel(input: {
+    providerID: string
+    provider: ConfigProviderValue
+    modelID: string
+    model: ConfigModelValue
+    existing?: Model
+    modelsDev: Awaited<ReturnType<typeof ModelsDev.get>>
+  }): Model {
+    const id = input.model.id ?? input.modelID
+    const name = iife(() => {
+      if (input.model.name) return input.model.name
+      if (input.model.id && input.model.id !== input.modelID) return input.modelID
+      return input.existing?.name ?? input.modelID
+    })
+    const providerID = ProviderID.make(input.providerID)
+    const parsed: Model = {
+      id: ModelID.make(input.modelID),
+      api: {
+        id,
+        npm:
+          input.model.provider?.npm ??
+          input.provider.npm ??
+          input.existing?.api.npm ??
+          input.modelsDev[input.providerID]?.npm ??
+          "@ai-sdk/openai-compatible",
+        url:
+          input.model.provider?.api ??
+          input.provider.api ??
+          input.existing?.api.url ??
+          input.modelsDev[input.providerID]?.api,
+      },
+      status: input.model.status ?? input.existing?.status ?? "active",
+      name,
+      providerID,
+      capabilities: {
+        temperature: input.model.temperature ?? input.existing?.capabilities.temperature ?? false,
+        reasoning: input.model.reasoning ?? input.existing?.capabilities.reasoning ?? false,
+        attachment: input.model.attachment ?? input.existing?.capabilities.attachment ?? false,
+        toolcall: input.model.tool_call ?? input.existing?.capabilities.toolcall ?? true,
+        input: {
+          text: input.model.modalities?.input?.includes("text") ?? input.existing?.capabilities.input.text ?? true,
+          audio: input.model.modalities?.input?.includes("audio") ?? input.existing?.capabilities.input.audio ?? false,
+          image: input.model.modalities?.input?.includes("image") ?? input.existing?.capabilities.input.image ?? false,
+          video: input.model.modalities?.input?.includes("video") ?? input.existing?.capabilities.input.video ?? false,
+          pdf: input.model.modalities?.input?.includes("pdf") ?? input.existing?.capabilities.input.pdf ?? false,
+        },
+        output: {
+          text: input.model.modalities?.output?.includes("text") ?? input.existing?.capabilities.output.text ?? true,
+          audio: input.model.modalities?.output?.includes("audio") ?? input.existing?.capabilities.output.audio ?? false,
+          image: input.model.modalities?.output?.includes("image") ?? input.existing?.capabilities.output.image ?? false,
+          video: input.model.modalities?.output?.includes("video") ?? input.existing?.capabilities.output.video ?? false,
+          pdf: input.model.modalities?.output?.includes("pdf") ?? input.existing?.capabilities.output.pdf ?? false,
+        },
+        interleaved: input.model.interleaved ?? false,
+      },
+      runtime: {
+        ...defaultRuntimePolicy({
+          providerID,
+          id: ModelID.make(input.modelID),
+          api: {
+            id,
+            url: input.model.provider?.api ?? input.provider.api ?? input.existing?.api.url ?? "",
+            npm:
+              input.model.provider?.npm ??
+              input.provider.npm ??
+              input.existing?.api.npm ??
+              input.modelsDev[input.providerID]?.npm ??
+              "@ai-sdk/openai-compatible",
+          },
+        }),
+        ...input.existing?.runtime,
+        ...runtimeOverrides(input.model.runtime),
+      },
+      cost: {
+        input: input.model.cost?.input ?? input.existing?.cost?.input ?? 0,
+        output: input.model.cost?.output ?? input.existing?.cost?.output ?? 0,
+        cache: {
+          read: input.model.cost?.cache_read ?? input.existing?.cost?.cache.read ?? 0,
+          write: input.model.cost?.cache_write ?? input.existing?.cost?.cache.write ?? 0,
+        },
+      },
+      options: mergeDeep(input.existing?.options ?? {}, input.model.options ?? {}),
+      limit: {
+        context: input.model.limit?.context ?? input.existing?.limit?.context ?? 0,
+        input: input.model.limit?.input ?? input.existing?.limit?.input,
+        output: input.model.limit?.output ?? input.existing?.limit?.output ?? 0,
+      },
+      headers: mergeDeep(input.existing?.headers ?? {}, input.model.headers ?? {}),
+      family: input.model.family ?? input.existing?.family ?? "",
+      release_date: input.model.release_date ?? input.existing?.release_date ?? "",
+      variants: {},
+    }
+    parsed.variants = mergeVariants(parsed, input.model.variants)
+    return parsed
+  }
+
+  function fromConfiguredProvider(input: {
+    providerID: string
+    provider: ConfigProviderValue
+    existing?: Info
+    modelsDev: Awaited<ReturnType<typeof ModelsDev.get>>
+  }): Info {
+    const parsed: Info = {
+      id: ProviderID.make(input.providerID),
+      name: input.provider.name ?? input.existing?.name ?? input.providerID,
+      env: input.provider.env ?? input.existing?.env ?? [],
+      options: mergeDeep(input.existing?.options ?? {}, input.provider.options ?? {}),
+      source: "config",
+      models: input.existing?.models ?? {},
+    }
+    for (const [modelID, model] of Object.entries(input.provider.models ?? {})) {
+      parsed.models[modelID] = fromConfiguredModel({
+        providerID: input.providerID,
+        provider: input.provider,
+        modelID,
+        model,
+        existing: parsed.models[model.id ?? modelID],
+        modelsDev: input.modelsDev,
+      })
+    }
+    return parsed
   }
   function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
     const m: Model = {
@@ -1076,307 +1220,268 @@ export namespace Provider {
             config: () => config.get(),
           }
 
-          const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES) as Array<[string, ProviderOverrideValue]>
+          log.info("init")
+
+          function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
+            const existing = providers[providerID]
+            if (existing) {
+              // @ts-expect-error
+              providers[providerID] = mergeDeep(existing, provider)
+              return
+            }
+            const match = database[providerID]
+            if (!match) return
+            // @ts-expect-error
+            providers[providerID] = mergeDeep(match, provider)
+          }
+
+          const plugins = yield* plugin.list()
           const configProviders = Object.entries(cfg.provider ?? {}) as Array<[string, ProviderConfigValue]>
+          const bundledOverrideProviders = Object.entries(PROVIDER_OVERRIDES) as Array<[string, ProviderOverrideValue]>
+          const disabled = new Set(cfg.disabled_providers ?? [])
+          const enabled = cfg.enabled_providers ? new Set(cfg.enabled_providers) : null
 
-    function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
-      const existing = providers[providerID]
-      if (existing) {
-        // @ts-expect-error
-        providers[providerID] = mergeDeep(existing, provider)
-        return
-      }
-      const match = database[providerID]
-      if (!match) return
-      // @ts-expect-error
-      providers[providerID] = mergeDeep(match, provider)
-    }
+          for (const [providerID, provider] of [...bundledOverrideProviders, ...configProviders]) {
+            database[providerID] = fromConfiguredProvider({
+              providerID,
+              provider,
+              existing: database[providerID],
+              modelsDev,
+            })
+          }
 
-    // extend database from bundled overrides, then user config
-    for (const [providerID, provider] of [...bundledOverrideProviders, ...configProviders]) {
-      const existing = database[providerID]
-      const parsed: Info = {
-        id: ProviderID.make(providerID),
-        name: provider.name ?? existing?.name ?? providerID,
-        env: provider.env ?? existing?.env ?? [],
-        options: mergeDeep(existing?.options ?? {}, provider.options ?? {}),
-        source: "config",
-        models: existing?.models ?? {},
-      }
+          const env = Env.all()
+          for (const [id, provider] of Object.entries(database)) {
+            const providerID = ProviderID.make(id)
+            if (disabled.has(providerID)) continue
+            const apiKey = provider.env.map((item) => env[item]).find(Boolean)
+            if (!apiKey) continue
+            mergeProvider(providerID, {
+              source: "env",
+              key: provider.env.length === 1 ? apiKey : undefined,
+            })
+          }
 
-      for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-        const existingModel = parsed.models[model.id ?? modelID]
-        const name = iife(() => {
-          if (model.name) return model.name
-          if (model.id && model.id !== modelID) return modelID
-          return existingModel?.name ?? modelID
-        })
-        const parsedModel: Model = {
-          id: ModelID.make(modelID),
-          api: {
-            id: model.id ?? existingModel?.api.id ?? modelID,
-            npm:
-              model.provider?.npm ??
-              provider.npm ??
-              existingModel?.api.npm ??
-              modelsDev[providerID]?.npm ??
-              "@ai-sdk/openai-compatible",
-            url: model.provider?.api ?? provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api,
-          },
-          status: model.status ?? existingModel?.status ?? "active",
-          name,
-          providerID: ProviderID.make(providerID),
-          capabilities: {
-            temperature: model.temperature ?? existingModel?.capabilities.temperature ?? false,
-            reasoning: model.reasoning ?? existingModel?.capabilities.reasoning ?? false,
-            attachment: model.attachment ?? existingModel?.capabilities.attachment ?? false,
-            toolcall: model.tool_call ?? existingModel?.capabilities.toolcall ?? true,
-            input: {
-              text: model.modalities?.input?.includes("text") ?? existingModel?.capabilities.input.text ?? true,
-              audio: model.modalities?.input?.includes("audio") ?? existingModel?.capabilities.input.audio ?? false,
-              image: model.modalities?.input?.includes("image") ?? existingModel?.capabilities.input.image ?? false,
-              video: model.modalities?.input?.includes("video") ?? existingModel?.capabilities.input.video ?? false,
-              pdf: model.modalities?.input?.includes("pdf") ?? existingModel?.capabilities.input.pdf ?? false,
-            },
-            output: {
-              text: model.modalities?.output?.includes("text") ?? existingModel?.capabilities.output.text ?? true,
-              audio: model.modalities?.output?.includes("audio") ?? existingModel?.capabilities.output.audio ?? false,
-              image: model.modalities?.output?.includes("image") ?? existingModel?.capabilities.output.image ?? false,
-              video: model.modalities?.output?.includes("video") ?? existingModel?.capabilities.output.video ?? false,
-              pdf: model.modalities?.output?.includes("pdf") ?? existingModel?.capabilities.output.pdf ?? false,
-            },
-            interleaved: model.interleaved ?? false,
-          },
-          runtime: {
-            ...defaultRuntimePolicy({ providerID, id: modelID, api: { id: model.id ?? existingModel?.api.id ?? modelID } } as Pick<Model, "providerID" | "id" | "api">),
-            ...existingModel?.runtime,
-            ...runtimeOverrides(model.runtime),
-          },
-          cost: {
-            input: model?.cost?.input ?? existingModel?.cost?.input ?? 0,
-            output: model?.cost?.output ?? existingModel?.cost?.output ?? 0,
-            cache: {
-              read: model?.cost?.cache_read ?? existingModel?.cost?.cache.read ?? 0,
-              write: model?.cost?.cache_write ?? existingModel?.cost?.cache.write ?? 0,
-            },
-          },
-          options: mergeDeep(existingModel?.options ?? {}, model.options ?? {}),
-          limit: {
-            context: model.limit?.context ?? existingModel?.limit?.context ?? 0,
-            output: model.limit?.output ?? existingModel?.limit?.output ?? 0,
-          },
-          headers: mergeDeep(existingModel?.headers ?? {}, model.headers ?? {}),
-          family: model.family ?? existingModel?.family ?? "",
-          release_date: model.release_date ?? existingModel?.release_date ?? "",
-          variants: {},
-        }
-        const merged = mergeDeep(ProviderTransform.variants(parsedModel), model.variants ?? {})
-        parsedModel.variants = mapValues(
-          pickBy(merged, (v) => !(v as { disabled?: boolean }).disabled),
-          (v) => omit(v, ["disabled"]),
-        )
-        parsed.models[modelID] = parsedModel
-      }
-      database[providerID] = parsed
-    }
+          const auths = yield* auth.all().pipe(Effect.orDie)
+          for (const [id, provider] of Object.entries(auths)) {
+            const providerID = ProviderID.make(id)
+            if (disabled.has(providerID)) continue
+            if (provider.type === "api") {
+              mergeProvider(providerID, {
+                source: "api",
+                key: provider.key,
+              })
+              continue
+            }
+            mergeProvider(providerID, {
+              source: "custom",
+            })
+          }
 
-    // load env
-    const env = Env.all()
-    for (const [id, provider] of Object.entries(database)) {
-      const providerID = ProviderID.make(id)
-      if (disabled.has(providerID)) continue
-      const apiKey = provider.env.map((item) => env[item]).find(Boolean)
-      if (!apiKey) continue
-      mergeProvider(providerID, {
-        source: "env",
-        key: provider.env.length === 1 ? apiKey : undefined,
-      })
-    }
+          for (const plugin of plugins) {
+            const authHook = plugin.auth
+            if (!authHook) continue
+            const providerID = ProviderID.make(authHook.provider)
+            if (disabled.has(providerID)) continue
 
-    // load apikeys
-    for (const [id, provider] of Object.entries(await Auth.all())) {
-      const providerID = ProviderID.make(id)
-      if (disabled.has(providerID)) continue
-      if (provider.type === "api") {
-        mergeProvider(providerID, {
-          source: "api",
-          key: provider.key,
-        })
-        continue
-      }
+            const stored = yield* auth.get(providerID).pipe(Effect.orDie)
+            if (!stored) continue
+            if (!authHook.loader) continue
 
-      mergeProvider(providerID, {
-        source: "custom",
-      })
-    }
-
-    for (const plugin of await Plugin.list()) {
-      if (!plugin.auth) continue
-      const providerID = ProviderID.make(plugin.auth.provider)
-      if (disabled.has(providerID)) continue
-
-      const auth = await Auth.get(providerID)
-      if (!auth) continue
-      if (!plugin.auth.loader) continue
-
-      if (auth) {
-        const options = await plugin.auth.loader(
-          () => Auth.get(providerID) as any,
-          providers[providerID] ?? database[providerID],
-        )
-        const opts = options ?? {}
-        const patch: Partial<Info> = providers[providerID]
-          ? { options: opts }
-          : { source: "custom", options: opts }
-        mergeProvider(providerID, patch)
-      }
-
-      // If this is github-copilot plugin, also register for github-copilot-enterprise if auth exists
-      if (providerID === ProviderID.githubCopilot) {
-        const enterpriseProviderID = ProviderID.make("github-copilot-enterprise")
-        if (!disabled.has(enterpriseProviderID)) {
-          const enterpriseAuth = await Auth.get(enterpriseProviderID)
-          if (enterpriseAuth) {
-            const enterpriseOptions = await plugin.auth.loader(
-              () => Auth.get(enterpriseProviderID) as any,
-              providers[enterpriseProviderID] ?? database[enterpriseProviderID],
+            const options = yield* Effect.promise(() =>
+              authHook.loader(
+                () => Effect.runPromise(auth.get(providerID).pipe(Effect.orDie)) as any,
+                providers[providerID] ?? database[authHook.provider],
+              ),
             )
-            const opts = enterpriseOptions ?? {}
-            const patch: Partial<Info> = providers[enterpriseProviderID]
+            const opts = options ?? {}
+            const patch: Partial<Info> = providers[providerID]
               ? { options: opts }
               : { source: "custom", options: opts }
-            mergeProvider(enterpriseProviderID, patch)
+            mergeProvider(providerID, patch)
+
+            if (providerID === ProviderID.githubCopilot) {
+              const enterpriseProviderID = ProviderID.make("github-copilot-enterprise")
+              if (disabled.has(enterpriseProviderID)) continue
+              const enterpriseAuth = yield* auth.get(enterpriseProviderID).pipe(Effect.orDie)
+              if (!enterpriseAuth) continue
+              const enterpriseOptions = yield* Effect.promise(() =>
+                authHook.loader(
+                  () => Effect.runPromise(auth.get(enterpriseProviderID).pipe(Effect.orDie)) as any,
+                  providers[enterpriseProviderID] ?? database[enterpriseProviderID],
+                ),
+              )
+              const enterpriseOpts = enterpriseOptions ?? {}
+              const enterprisePatch: Partial<Info> = providers[enterpriseProviderID]
+                ? { options: enterpriseOpts }
+                : { source: "custom", options: enterpriseOpts }
+              mergeProvider(enterpriseProviderID, enterprisePatch)
+            }
           }
-        }
-      }
-    }
 
-    for (const [id, fn] of Object.entries(CUSTOM_LOADERS)) {
-      const providerID = ProviderID.make(id)
-      if (disabled.has(providerID)) continue
-      const data = database[providerID]
-      if (!data) {
-        log.error("Provider does not exist in model list " + providerID)
-        continue
-      }
-      const result = await fn(data)
-      if (result && (result.autoload || providers[providerID])) {
-        if (result.getModel) modelLoaders[providerID] = result.getModel
-        if (result.vars) varsLoaders[providerID] = result.vars
-        const opts = result.options ?? {}
-        const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
-        mergeProvider(providerID, patch)
-      }
-    }
-
-    // load config
-    for (const [id, provider] of configProviders) {
-      const providerID = ProviderID.make(id)
-      const partial: Partial<Info> = { source: "config" }
-      if (provider.env) partial.env = provider.env
-      if (provider.name) partial.name = provider.name
-      if (provider.options) partial.options = provider.options
-      mergeProvider(providerID, partial)
-    }
-
-    for (const [id, provider] of Object.entries(providers)) {
-      const providerID = ProviderID.make(id)
-      if (!isProviderAllowed(providerID)) {
-        delete providers[providerID]
-        continue
-      }
-
-      const configProvider = config.provider?.[providerID]
-
-      for (const [modelID, model] of Object.entries(provider.models)) {
-        model.api.id = model.api.id ?? model.id ?? modelID
-        if (
-          modelID === "gpt-5-chat-latest" ||
-          (providerID === ProviderID.openrouter && modelID === "openai/gpt-5-chat")
-        )
-          delete provider.models[modelID]
-        if (model.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
-        if (model.status === "deprecated") delete provider.models[modelID]
-        if (
-          (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||
-          (configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
-        )
-          delete provider.models[modelID]
-
-        model.variants = mapValues(ProviderTransform.variants(model), (v) => v)
-
-        // Filter out disabled variants from config
-        const configVariants = configProvider?.models?.[modelID]?.variants
-        if (configVariants && model.variants) {
-          const merged = mergeDeep(model.variants, configVariants)
-          model.variants = mapValues(
-            pickBy(merged, (v) => !v.disabled),
-            (v) => omit(v, ["disabled"]),
-          )
-        }
-      }
-
-      if (Object.keys(provider.models).length === 0) {
-        delete providers[providerID]
-        continue
-      }
-
-      log.info("found", { providerID })
-    }
-
-    return {
-      models: languages,
-      providers,
-      sdk,
-      modelLoaders,
-      varsLoaders,
-    }
-  })
-
-  export async function list() {
-    return state().then((state) => state.providers)
-  }
-
-  async function getSDK(model: Model) {
-    try {
-      using _ = log.time("getSDK", {
-        providerID: model.providerID,
-      })
-      const s = await state()
-      const provider = s.providers[model.providerID]
-      const options = { ...provider.options }
-
-      if (model.providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
-        delete options.fetch
-      }
-
-      if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
-        options["includeUsage"] = true
-      }
-
-      const baseURL = iife(() => {
-        let url =
-          typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
-        if (!url) return
-
-        // some models/providers have variable urls, ex: "https://${AZURE_RESOURCE_NAME}.services.ai.azure.com/anthropic/v1"
-        // We track this in models.dev, and then when we are resolving the baseURL
-        // we need to string replace that literal: "${AZURE_RESOURCE_NAME}"
-        const loader = s.varsLoaders[model.providerID]
-        if (loader) {
-          const vars = loader(options)
-          for (const [key, value] of Object.entries(vars)) {
-            const field = "${" + key + "}"
-            url = url.replaceAll(field, value)
+          for (const [id, fn] of Object.entries(custom(dep))) {
+            const providerID = ProviderID.make(id)
+            if (disabled.has(providerID)) continue
+            const data = database[providerID]
+            if (!data) {
+              log.error("Provider does not exist in model list " + providerID)
+              continue
+            }
+            const result = yield* fn(data)
+            if (result && (result.autoload || providers[providerID])) {
+              if (result.getModel) modelLoaders[providerID] = result.getModel
+              if (result.vars) varsLoaders[providerID] = result.vars
+              if (result.discoverModels) discoveryLoaders[providerID] = result.discoverModels
+              const opts = result.options ?? {}
+              const patch: Partial<Info> = providers[providerID]
+                ? { options: opts }
+                : { source: "custom", options: opts }
+              mergeProvider(providerID, patch)
+            }
           }
-        }
 
-        url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
-          const val = Env.get(String(key))
-          return val ?? item
-        })
-        return url
-      })
+          for (const [id, provider] of configProviders) {
+            const providerID = ProviderID.make(id)
+            const partial: Partial<Info> = { source: "config" }
+            if (provider.env) partial.env = provider.env
+            if (provider.name) partial.name = provider.name
+            if (provider.options) partial.options = provider.options
+            mergeProvider(providerID, partial)
+          }
+
+          const gitlab = ProviderID.make("gitlab")
+          if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab, disabled, enabled)) {
+            yield* Effect.promise(async () => {
+              try {
+                const discovered = await discoveryLoaders[gitlab]()
+                for (const [modelID, model] of Object.entries(discovered)) {
+                  if (!providers[gitlab].models[modelID]) providers[gitlab].models[modelID] = model
+                }
+              } catch (e) {
+                log.warn("state discovery error", { id: "gitlab", error: e })
+              }
+            })
+          }
+
+          for (const hook of plugins) {
+            const p = hook.provider
+            const models = p?.models
+            if (!p || !models) continue
+
+            const providerID = ProviderID.make(p.id)
+            if (disabled.has(providerID)) continue
+
+            const provider = providers[providerID]
+            if (!provider) continue
+            const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
+
+            provider.models = yield* Effect.promise(async () => {
+              const next = await models(provider, { auth: pluginAuth })
+              return Object.fromEntries(
+                Object.entries(next).map(([id, model]) => [
+                  id,
+                  {
+                    ...model,
+                    id: ModelID.make(id),
+                    providerID,
+                  },
+                ]),
+              )
+            })
+          }
+
+          for (const [id, provider] of Object.entries(providers)) {
+            const providerID = ProviderID.make(id)
+            if (!isProviderAllowed(providerID, disabled, enabled)) {
+              delete providers[providerID]
+              continue
+            }
+
+            const configProvider = cfg.provider?.[providerID]
+
+            for (const [modelID, model] of Object.entries(provider.models)) {
+              model.api.id = model.api.id ?? model.id ?? modelID
+              if (
+                modelID === "gpt-5-chat-latest" ||
+                (providerID === ProviderID.openrouter && modelID === "openai/gpt-5-chat")
+              )
+                delete provider.models[modelID]
+              if (model.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
+              if (model.status === "deprecated") delete provider.models[modelID]
+              if (
+                (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||
+                (configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
+              )
+                delete provider.models[modelID]
+
+              model.variants = mapValues(ProviderTransform.variants(model), (v) => v)
+
+              const configVariants = configProvider?.models?.[modelID]?.variants
+              if (configVariants && model.variants) {
+                const merged = mergeDeep(model.variants, configVariants)
+                model.variants = mapValues(
+                  pickBy(merged, (v) => !v.disabled),
+                  (v) => omit(v, ["disabled"]),
+                )
+              }
+            }
+
+            if (Object.keys(provider.models).length === 0) {
+              delete providers[providerID]
+              continue
+            }
+
+            log.info("found", { providerID })
+          }
+
+          return {
+            models: languages,
+            providers,
+            sdk,
+            modelLoaders,
+            varsLoaders,
+          }
+        }),
+      )
+
+      const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
+
+      async function resolveSDK(model: Model, s: State) {
+        try {
+          using _ = log.time("getSDK", {
+            providerID: model.providerID,
+          })
+          const provider = s.providers[model.providerID]
+          const options = { ...provider.options }
+
+          if (model.providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
+            delete options.fetch
+          }
+
+          if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
+            options["includeUsage"] = true
+          }
+
+          const baseURL = iife(() => {
+            let url =
+              typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
+            if (!url) return
+
+            const loader = s.varsLoaders[model.providerID]
+            if (loader) {
+              const vars = loader(options)
+              for (const [key, value] of Object.entries(vars)) {
+                const field = "${" + key + "}"
+                url = url.replaceAll(field, value)
+              }
+            }
+
+            url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
+              const val = Env.get(String(key))
+              return val ?? item
+            })
+            return url
+          })
 
           if (baseURL !== undefined) options["baseURL"] = baseURL
           if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
@@ -1416,16 +1521,13 @@ export namespace Provider {
             const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
             if (combined) opts.signal = combined
 
-            // Strip openai itemId metadata following what codex does
             if (model.api.npm === "@ai-sdk/openai" && opts.body && opts.method === "POST") {
               const body = JSON.parse(opts.body as string)
               const isAzure = model.providerID.includes("azure")
               const keepIds = isAzure && body.store === true
               if (!keepIds && Array.isArray(body.input)) {
                 for (const item of body.input) {
-                  if ("id" in item) {
-                    delete item.id
-                  }
+                  if ("id" in item) delete item.id
                 }
                 opts.body = JSON.stringify(body)
               }
@@ -1433,9 +1535,8 @@ export namespace Provider {
 
             const res = await fetchFn(input, {
               ...opts,
-              // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
               timeout: false,
-            })
+            } as BunFetchRequestInit)
 
             if (!chunkAbortCtl) return res
             return wrapSSE(res, chunkTimeout, chunkAbortCtl)
@@ -1466,7 +1567,6 @@ export namespace Provider {
           }
 
           const mod = await import(installedPath)
-
           const fn = mod[Object.keys(mod).find((key) => key.startsWith("create"))!]
           const loaded = fn({
             name: model.providerID,
