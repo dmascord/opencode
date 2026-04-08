@@ -28,6 +28,16 @@ type QuotaMap = Record<string, {
   minimaxUsage?: {
     fiveHour?: { utilization: number; resetsAt?: string; remainingCredits?: number; totalCredits?: number }
   }
+  githubCopilotUsage?: {
+    hasAccess?: boolean
+    login?: string
+    orgBillingBreakdown?: {
+      planType: string
+      totalSeats: number
+      activeSeats: number
+    }
+    statusMessage?: string
+  }
 }>
 
 function quotaProvider(model?: { providerID: string; modelID: string }) {
@@ -35,6 +45,7 @@ function quotaProvider(model?: { providerID: string; modelID: string }) {
   if (model.providerID === "anthropic") return "anthropic"
   if (model.providerID === "openai") return "codex"
   if (model.providerID.startsWith("minimax") || model.modelID.includes("minimax")) return "minimax"
+  if (model.providerID === "github-copilot") return "github-copilot"
 }
 
 function formatQuotaReset(resetAt?: string) {
@@ -149,6 +160,25 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
       return {
         title: "MiniMax",
         lines: [`5h: ${item.utilization}% used${credits}${item.resetsAt ? `, resets ${formatQuotaReset(item.resetsAt)}` : ""}`],
+      }
+    }
+    if (provider === "github-copilot") {
+      const item = data["github-copilot"]
+      if (!item) return
+      const cop = item.githubCopilotUsage
+      const title = cop?.orgBillingBreakdown?.planType
+        ? `GitHub Copilot (${cop.orgBillingBreakdown.planType})`
+        : "GitHub Copilot"
+      return {
+        title,
+        lines: [
+          cop?.login ? `Connected as ${cop.login}` : undefined,
+          cop?.orgBillingBreakdown
+            ? `${cop.orgBillingBreakdown.activeSeats}/${cop.orgBillingBreakdown.totalSeats} seats active`
+            : cop?.hasAccess
+              ? undefined
+              : cop?.statusMessage ?? undefined,
+        ].filter(Boolean),
       }
     }
   })

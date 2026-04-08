@@ -113,6 +113,30 @@ type QuotaUsage = {
   minimaxUsage?: {
     fiveHour?: { utilization: number; resetsAt?: string; remainingCredits?: number; totalCredits?: number }
   }
+  githubCopilotUsage?: {
+    hasAccess?: boolean
+    assignedDate?: string
+    lastActivityDate?: string
+    orgBillingBreakdown?: {
+      planType: string
+      totalSeats: number
+      activeSeats: number
+      inactiveSeats: number
+      pendingInvitation: number
+      pendingCancellation: number
+    }
+    organizations?: Array<{ name: string; role: string }>
+    statusMessage?: string
+  }
+  openrouterUsage?: {
+    isFree?: boolean
+    usage?: number
+    usageDaily?: number
+    usageWeekly?: number
+    usageMonthly?: number
+    limit?: number | null
+    limitRemaining?: number | null
+  }
 }
 
 type QuotaMap = Record<string, QuotaUsage>
@@ -154,7 +178,7 @@ function usageColor(utilization: number) {
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
-function ProviderQuotaSection(props: { providerID?: string }) {
+export function ProviderQuotaSection(props: { providerID?: string }) {
   const globalSDK = useGlobalSDK()
   const [rateLimitedUntil, setRateLimitedUntil] = createSignal<number>(0)
   const [lastSuccessfulFetch, setLastSuccessfulFetch] = createSignal<number>(0)
@@ -188,12 +212,8 @@ function ProviderQuotaSection(props: { providerID?: string }) {
     onCleanup(() => clearInterval(interval))
   })
 
-  const quota = createMemo(() => {
-    const providerID = props.providerID
-    const data = usage()
-    if (!providerID || !data) return
-
-    if (providerID === 'anthropic') {
+  const quotaForProvider = (pid: string, data: QuotaMap) => {
+    if (pid === 'anthropic') {
       const item = data.anthropic
       const limits: QuotaLine[] = []
       if (item?.anthropicUsage?.fiveHour)
@@ -206,14 +226,14 @@ function ProviderQuotaSection(props: { providerID?: string }) {
       return { title: 'Anthropic / Claude', subtitle: 'Claude Pro/Max', lines: limits, accounts: item.accounts ?? [] }
     }
 
-    if (providerID === 'openai' || providerID === 'codex') {
+    if (pid === 'openai' || pid === 'codex') {
       const item = data.codex
       const limits = codexLines(item?.codexUsage)
       if (!limits.length) return
       return { title: 'OpenAI Codex', subtitle: item.codexUsage?.planType, lines: limits, accounts: item.accounts ?? [] }
     }
 
-    if (providerID.startsWith('minimax')) {
+    if (pid.startsWith('minimax')) {
       const item = data.minimax
       if (!item?.minimaxUsage?.fiveHour) return
       const limit = item.minimaxUsage.fiveHour
@@ -226,6 +246,32 @@ function ProviderQuotaSection(props: { providerID?: string }) {
         accounts: item.accounts ?? [],
       }
     }
+
+    if (pid === 'github-copilot') {
+      const item = data['github-copilot']
+      if (!item) return
+      const cop = item.githubCopilotUsage
+      const sub = cop?.orgBillingBreakdown?.planType
+        ?? (cop?.hasAccess ? 'Access granted' : undefined)
+      const info = cop?.statusMessage
+        ?? (cop?.orgBillingBreakdown
+          ? `${cop.orgBillingBreakdown.activeSeats} / ${cop.orgBillingBreakdown.totalSeats} seats active`
+          : cop ? undefined : 'Connected')
+      return { title: 'GitHub Copilot', subtitle: sub, info, lines: [] as QuotaLine[], accounts: item.accounts ?? [] }
+    }
+  }
+
+  const quota = createMemo(() => {
+    const pid = props.providerID
+    const data = usage()
+    if (!data) return
+    // Single-provider mode
+    if (pid) return quotaForProvider(pid, data) ? [quotaForProvider(pid, data)!] : undefined
+    // All-providers mode: collect all known providers that have data
+    const all = ['anthropic', 'codex', 'minimax', 'github-copilot']
+      .map((id) => quotaForProvider(id, data))
+      .filter((q): q is NonNullable<ReturnType<typeof quotaForProvider>> => q !== undefined)
+    return all.length ? all : undefined
   })
 
   const switchAccount = async (recordID: string) => {
@@ -245,99 +291,108 @@ function ProviderQuotaSection(props: { providerID?: string }) {
           </div>
         </Show>
         <Show when={quota()}>
-          {(data) => (
-            <>
-              <div class="text-11-regular text-text-muted">{data().title}</div>
-              <Show when={data().subtitle}>
-                {(subtitle) => <div class="text-11-regular text-text-weaker">{subtitle()}</div>}
-              </Show>
-              <For each={data().lines}>
-                {(line) => (
-                  <div class="flex flex-col gap-1">
-                    <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden">
-                      <div
-                        class="h-full transition-all"
-                        style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
-                      />
-                    </div>
-                    <div class="flex items-center gap-1 text-11-regular text-text-weak">
-                      <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
-                      <div>{line.label}</div>
-                      <div class="text-text-weaker">{line.utilization}% used</div>
-                      <Show when={line.resetsAt}>
-                        <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
-                      </Show>
-                    </div>
-                  </div>
-                )}
-              </For>
-              <Show when={(data().accounts?.length ?? 0) > 1}>
-                <div class="flex flex-col gap-2 pt-1">
-                  <div class="flex flex-wrap gap-1">
-                    <For each={data().accounts}>
-                      {(account, index) => (
-                        <button
-                          type="button"
-                          class="px-2 py-1 rounded border text-11-medium transition-colors"
-                          classList={{
-                            'border-fill-success-base bg-fill-success-ghost text-fill-success-base': !!account.isActive,
-                            'border-border-base bg-surface-base text-text-muted hover:text-text-base': !account.isActive,
-                          }}
-                          onClick={() => !account.isActive && switchAccount(account.id)}
-                        >
-                          {(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                  <For each={data().accounts}>
-                    {(account, index) => (
-                      <Show when={codexLines(account.codexUsage).length}>
-                        <div class="flex flex-col gap-1 rounded border border-border-base bg-surface-base p-2">
-                          <div class="flex items-center gap-2 text-11-medium text-text-weak">
-                            <div>{(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}</div>
-                            <Show when={account.isActive}>
-                              <div class="text-fill-success-base">active</div>
-                            </Show>
-                            <Show when={account.codexUsage?.planType}>
-                              {(plan) => <div class="text-text-weaker ml-auto">{plan()}</div>}
-                            </Show>
-                          </div>
-                          <For each={codexLines(account.codexUsage)}>
-                            {(line) => (
-                              <div class="flex flex-col gap-1">
-                                <div class="h-2 w-full rounded-full bg-background-base overflow-hidden">
-                                  <div
-                                    class="h-full transition-all"
-                                    style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
-                                  />
-                                </div>
-                                <div class="flex items-center gap-1 text-11-regular text-text-weak">
-                                  <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
-                                  <div>{line.label}</div>
-                                  <div class="text-text-weaker">{line.utilization}% used</div>
-                                  <Show when={line.resetsAt}>
-                                    <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
-                                  </Show>
-                                </div>
-                              </div>
-                            )}
-                          </For>
+          {(items) => (
+            <For each={items()}>
+              {(data) => (
+                <>
+                  <div class="text-11-regular text-text-muted">{data.title}</div>
+                  <Show when={data.subtitle}>
+                    {(subtitle) => <div class="text-11-regular text-text-weaker">{subtitle()}</div>}
+                  </Show>
+                  <Show when={data.info && !data.lines.length}>
+                    <div class="text-11-regular text-text-weaker">{data.info}</div>
+                  </Show>
+                  <For each={data.lines}>
+                    {(line) => (
+                      <div class="flex flex-col gap-1">
+                        <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden">
+                          <div
+                            class="h-full transition-all"
+                            style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
+                          />
                         </div>
-                      </Show>
+                        <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                          <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
+                          <div>{line.label}</div>
+                          <div class="text-text-weaker">{line.utilization}% used</div>
+                          <Show when={line.resetsAt}>
+                            <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
+                          </Show>
+                        </div>
+                      </div>
                     )}
                   </For>
-                </div>
-              </Show>
-              <button
-                type="button"
-                class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start"
-                onClick={() => actions.refetch()}
-              >
-                Refresh
-              </button>
-            </>
+                  <Show when={(data.accounts?.length ?? 0) > 1}>
+                    <div class="flex flex-col gap-2 pt-1">
+                      <div class="flex flex-wrap gap-1">
+                        <For each={data.accounts}>
+                          {(account, index) => (
+                            <button
+                              type="button"
+                              class="px-2 py-1 rounded border text-11-medium transition-colors"
+                              classList={{
+                                'border-fill-success-base bg-fill-success-ghost text-fill-success-base': !!account.isActive,
+                                'border-border-base bg-surface-base text-text-muted hover:text-text-base': !account.isActive,
+                              }}
+                              onClick={() => !account.isActive && switchAccount(account.id)}
+                            >
+                              {(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                      <For each={data.accounts}>
+                        {(account, index) => (
+                          <Show when={codexLines(account.codexUsage).length}>
+                            <div class="flex flex-col gap-1 rounded border border-border-base bg-surface-base p-2">
+                              <div class="flex items-center gap-2 text-11-medium text-text-weak">
+                                <div>{(account.label && account.label !== 'default' ? account.label : `Account ${index() + 1}`) ?? account.id}</div>
+                                <Show when={account.isActive}>
+                                  <div class="text-fill-success-base">active</div>
+                                </Show>
+                                <Show when={account.codexUsage?.planType}>
+                                  {(plan) => <div class="text-text-weaker ml-auto">{plan()}</div>}
+                                </Show>
+                              </div>
+                              <For each={codexLines(account.codexUsage)}>
+                                {(line) => (
+                                  <div class="flex flex-col gap-1">
+                                    <div class="h-2 w-full rounded-full bg-background-base overflow-hidden">
+                                      <div
+                                        class="h-full transition-all"
+                                        style={{ width: `${line.utilization}%`, 'background-color': usageColor(line.utilization) }}
+                                      />
+                                    </div>
+                                    <div class="flex items-center gap-1 text-11-regular text-text-weak">
+                                      <div class="size-2 rounded-sm" style={{ 'background-color': usageColor(line.utilization) }} />
+                                      <div>{line.label}</div>
+                                      <div class="text-text-weaker">{line.utilization}% used</div>
+                                      <Show when={line.resetsAt}>
+                                        <div class="text-text-weaker ml-auto">resets {formatResetTime(line.resetsAt)}</div>
+                                      </Show>
+                                    </div>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </>
+              )}
+            </For>
           )}
+        </Show>
+        <Show when={quota()}>
+          <button
+            type="button"
+            class="text-11-regular text-text-muted hover:text-text-base transition-colors self-start"
+            onClick={() => actions.refetch()}
+          >
+            Refresh
+          </button>
         </Show>
       </div>
     </Show>
