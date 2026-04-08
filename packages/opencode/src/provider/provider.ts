@@ -62,7 +62,10 @@ import { PROVIDER_OVERRIDES } from "./overrides"
 export namespace Provider {
   const log = Log.create({ service: "provider" })
   const DEFAULT_PROVIDER_TIMEOUT_MS = 900_000
-  const DEFAULT_CHUNK_TIMEOUT_MS = 90_000
+  // Heavy thinking models (GPT-5.4, Claude extended) can go several minutes
+  // between SSE chunks. 90s killed sessions mid-thought; 300s matches the
+  // general provider timeout budget without dropping real stalls too late.
+  const DEFAULT_CHUNK_TIMEOUT_MS = 300_000
 
   function shouldUseCopilotResponsesApi(modelID: string): boolean {
     const match = /^gpt-(\d+)/.exec(modelID)
