@@ -98,6 +98,7 @@ export namespace CopilotModels {
       },
       options: prev?.options ?? {},
       headers: prev?.headers ?? {},
+      runtime: prev?.runtime ?? {},
       release_date:
         prev?.release_date ??
         (remote.version.startsWith(`${remote.id}-`) ? remote.version.slice(remote.id.length + 1) : remote.version),

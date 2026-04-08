@@ -105,6 +105,7 @@ test("preserves temperature support from existing provider models", async () => 
         },
         options: {},
         headers: {},
+        runtime: {},
         release_date: "2024-05-13",
         variants: {},
         status: "active",

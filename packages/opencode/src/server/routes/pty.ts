@@ -9,8 +9,8 @@ import { errors } from "../error"
 
 const PTY_IDLE_TIMEOUT = 45
 
-export const PtyRoutes = lazy(() =>
-  new Hono()
+export function PtyRoutes(upgradeWebSocket: UpgradeWebSocket) {
+  return new Hono()
     .get(
       "/",
       describeRoute({
@@ -183,7 +183,7 @@ export const PtyRoutes = lazy(() =>
         return {
           idleTimeout: PTY_IDLE_TIMEOUT,
           sendPings: true,
-          onOpen(_event, ws) {
+          async onOpen(_event, ws) {
             const socket = ws.raw
             if (!isSocket(socket)) {
               ws.close()

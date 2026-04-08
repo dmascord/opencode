@@ -60,6 +60,7 @@ const providers: Provider[] = [
         status: "active",
         options: {},
         headers: {},
+        runtime: {},
         release_date: "2025-05-14",
       },
     },

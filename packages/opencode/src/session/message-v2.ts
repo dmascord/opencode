@@ -22,7 +22,7 @@ interface FetchDecompressionError extends Error {
   path: string
 }
 import { Question } from "@/question"
-import { PermissionNext } from "@/permission"
+import { Permission } from "@/permission"
 
 export namespace MessageV2 {
   export function isMedia(mime: string) {
@@ -999,7 +999,7 @@ export namespace MessageV2 {
           },
           { cause: e },
         ).toObject()
-      case e instanceof Question.RejectedError || e instanceof PermissionNext.RejectedError || e instanceof PermissionNext.CorrectedError:
+      case e instanceof Question.RejectedError || e instanceof Permission.RejectedError || e instanceof Permission.CorrectedError:
         return new NamedError.Unknown({ message: e.message }, { cause: e }).toObject()
       case e instanceof Error:
         if (e.name === "TimeoutError" || /timed out/i.test(e.message)) {

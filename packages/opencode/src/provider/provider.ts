@@ -657,6 +657,11 @@ export namespace Provider {
                       },
                       interleaved: false,
                     },
+                    runtime: defaultRuntimePolicy({
+                      providerID: ProviderID.make("gitlab"),
+                      id: ModelID.make(m.id),
+                      api: { id: m.id, url: instanceUrl, npm: "gitlab-ai-provider" },
+                    }),
                     release_date: "",
                     variants: {},
                   }
@@ -1286,10 +1291,11 @@ export namespace Provider {
 
             const stored = yield* auth.get(providerID).pipe(Effect.orDie)
             if (!stored) continue
-            if (!authHook.loader) continue
+            const loader = authHook.loader
+            if (!loader) continue
 
             const options = yield* Effect.promise(() =>
-              authHook.loader(
+              loader(
                 () => Effect.runPromise(auth.get(providerID).pipe(Effect.orDie)) as any,
                 providers[providerID] ?? database[authHook.provider],
               ),
@@ -1306,7 +1312,7 @@ export namespace Provider {
               const enterpriseAuth = yield* auth.get(enterpriseProviderID).pipe(Effect.orDie)
               if (!enterpriseAuth) continue
               const enterpriseOptions = yield* Effect.promise(() =>
-                authHook.loader(
+                loader(
                   () => Effect.runPromise(auth.get(enterpriseProviderID).pipe(Effect.orDie)) as any,
                   providers[enterpriseProviderID] ?? database[enterpriseProviderID],
                 ),

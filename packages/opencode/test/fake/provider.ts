@@ -25,6 +25,7 @@ export namespace ProviderTest {
       status: "active",
       options: {},
       headers: {},
+      runtime: {},
       release_date: "2025-01-01",
       ...override,
     }

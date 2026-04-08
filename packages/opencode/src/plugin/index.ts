@@ -22,10 +22,40 @@ import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } fro
 export namespace Plugin {
   const log = Log.create({ service: "plugin" })
 
-  // Anthropic OAuth is now handled internally - no external plugin needed
-  const BUILTIN: string[] = []
+  type State = {
+    hooks: Hooks[]
+  }
+
+  type TriggerName = {
+    [K in keyof Hooks]-?: NonNullable<Hooks[K]> extends (input: any, output: any) => Promise<void> ? K : never
+  }[keyof Hooks]
+
+  export interface Interface {
+    readonly trigger: <
+      Name extends TriggerName,
+      Input = Parameters<Required<Hooks>[Name]>[0],
+      Output = Parameters<Required<Hooks>[Name]>[1],
+    >(
+      name: Name,
+      input: Input,
+      output: Output,
+    ) => Effect.Effect<Output>
+    readonly list: () => Effect.Effect<Hooks[]>
+    readonly init: () => Effect.Effect<void>
+  }
+
+  export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/Plugin") {}
+
   // Built-in plugins that are directly imported (not installed from npm)
-  const INTERNAL_PLUGINS: PluginInstance[] = [AnthropicAuthPlugin, CodexAuthPlugin, CopilotAuthPlugin, GitlabAuthPlugin, CloudflareWorkersAuthPlugin, CloudflareAIGatewayAuthPlugin]
+  const INTERNAL_PLUGINS: PluginInstance[] = [
+    AnthropicAuthPlugin,
+    CodexAuthPlugin,
+    CopilotAuthPlugin,
+    GitlabAuthPlugin,
+    PoeAuthPlugin,
+    CloudflareWorkersAuthPlugin,
+    CloudflareAIGatewayAuthPlugin,
+  ]
 
   function isServerPlugin(value: unknown): value is PluginInstance {
     return typeof value === "function"
