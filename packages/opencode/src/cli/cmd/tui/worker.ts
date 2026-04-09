@@ -18,7 +18,7 @@ import { Heap } from "@/cli/heap"
 
 const fetchFn = (url: string, init?: RequestInit) => Server.Default().fetch(url, init)
 
-const SSE_WATCHDOG_MS = 30_000
+const SSE_WATCHDOG_MS = Flag.OPENCODE_EXPERIMENTAL_TUI_SSE_WATCHDOG_MS || 300_000
 
 await Log.init({
   print: process.argv.includes("--print-logs"),
@@ -56,21 +56,62 @@ const eventStream = {
 }
 
 function startEventStream(directory: string) {
+  if (eventStream.abort) eventStream.abort.abort()
   const id = crypto.randomUUID()
+  let run = 0
 
   const abort = new AbortController()
+  eventStream.abort = abort
   const signal = abort.signal
   let watchdog: Timer | undefined
   let stale = false
   let watch = false
+  let last = Date.now()
+  let kind = "startup"
 
-  const touch = () => {
+  Log.Default.info("event stream start", {
+    id,
+    directory,
+    watchdog: SSE_WATCHDOG_MS,
+  })
+
+  const touch = (next = "activity") => {
+    const now = Date.now()
+    const idle = now - last
     if (!watch) return
     stale = false
+    last = now
+    kind = next
     if (watchdog) clearTimeout(watchdog)
+    if (next === "server.heartbeat") {
+      Log.Default.debug("event stream heartbeat", {
+        id,
+        directory,
+        run,
+        idle,
+      })
+    }
+    if (next !== "server.heartbeat" && idle > 10_000) {
+      Log.Default.info("event stream gap", {
+        id,
+        directory,
+        run,
+        idle,
+        kind: next,
+      })
+    }
     watchdog = setTimeout(() => {
       stale = true
-      eventStream.live?.abort(new Error("Worker event stream heartbeat timed out"))
+      const err = new Error("Worker event stream heartbeat timed out")
+      Log.Default.warn("event stream watchdog timeout", {
+        id,
+        directory,
+        watchdog: SSE_WATCHDOG_MS,
+        idle: Date.now() - last,
+        kind,
+        run,
+      })
+      eventStream.live?.abort(err)
     }, SSE_WATCHDOG_MS)
   }
 
@@ -83,53 +124,139 @@ function startEventStream(directory: string) {
 
   ;(async () => {
     watch = true
-    touch()
+    touch("boot")
     try {
       while (!signal.aborted) {
+        run += 1
         const cycle = new AbortController()
         eventStream.live = cycle
         const combined = AbortSignal.any([signal, cycle.signal])
+        Log.Default.debug("event stream subscribe", {
+          id,
+          directory,
+          run,
+        })
         const events = await Promise.resolve(sdk.event.subscribe({}, { signal: combined })).catch((error) => {
           if (signal.aborted) return undefined
-          if (!stale) throw error
+          Log.Default.warn("event stream subscribe failed", {
+            id,
+            directory,
+            run,
+            stale,
+            idle: Date.now() - last,
+            kind,
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          })
+          if (!stale) {
+            Log.Default.error("event stream non-stale failure - will retry", {
+              id,
+              directory,
+              run,
+              idle: Date.now() - last,
+              kind,
+            })
+          }
           return undefined
         })
 
         if (!events) {
-          touch()
+          touch(stale ? "retry" : "idle")
           await sleep(250)
           continue
         }
 
+        Log.Default.info("event stream subscribed", {
+          id,
+          directory,
+          run,
+        })
+
         try {
           for await (const event of events.stream) {
             const type = event.type as string
-            touch()
+            touch(type)
             if (type === "server.heartbeat" || type === "server.connected") continue
             Rpc.emit("event", event as Event)
           }
         } catch (error) {
-          if (signal.aborted) break
+          const errMsg = error instanceof Error ? error.message : String(error)
+          const errStack = error instanceof Error ? error.stack : undefined
+          if (signal.aborted) {
+            Log.Default.warn("event stream loop exiting - signal aborted", {
+              id,
+              directory,
+              run,
+              idle: Date.now() - last,
+              kind,
+            })
+            break
+          }
           if (combined.aborted && stale) {
-            touch()
+            Log.Default.warn("event stream aborted after watchdog", {
+              id,
+              directory,
+              run,
+              idle: Date.now() - last,
+              kind,
+              error: errMsg,
+              stack: errStack,
+            })
+            touch("retry")
             continue
           }
-          throw error
+          Log.Default.error("event stream cycle failed - non-watchdog error", {
+            id,
+            directory,
+            run,
+            stale,
+            idle: Date.now() - last,
+            kind,
+            error: errMsg,
+            stack: errStack,
+            combinedAborted: combined.aborted,
+          })
+          // Don't throw - try to reconnect instead
+          touch("retry")
+          continue
         } finally {
+          Log.Default.debug("event stream cycle end", {
+            id,
+            directory,
+            run,
+            stale,
+            aborted: signal.aborted,
+            live: eventStream.live === cycle,
+          })
           cycle.abort()
           if (eventStream.live === cycle) eventStream.live = undefined
         }
 
         if (!signal.aborted) {
-          touch()
+          touch("cycle-end")
           await sleep(250)
         }
       }
     } finally {
       if (watchdog) clearTimeout(watchdog)
+      Log.Default.info("event stream stop", {
+        id,
+        directory,
+        run,
+        aborted: signal.aborted,
+        stale,
+        idle: Date.now() - last,
+        kind,
+      })
     }
   })().catch((error) => {
     Log.Default.error("event stream error", {
+      id,
+      directory,
+      run,
+      stale,
+      idle: Date.now() - last,
+      kind,
       error: error instanceof Error ? error.message : error,
     })
   })
@@ -138,7 +265,9 @@ function startEventStream(directory: string) {
 }
 
 function stopEventStream(id: string) {
+  Log.Default.info("event stream unsubscribe", { id })
   eventStream.abort?.abort()
+  eventStream.abort = undefined
 }
 
 export const rpc = {

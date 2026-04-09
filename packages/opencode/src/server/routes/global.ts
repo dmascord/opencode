@@ -19,27 +19,45 @@ export const GlobalDisposedEvent = BusEvent.define("global.disposed", z.object({
 
 async function streamEvents(c: Context, subscribe: (q: AsyncQueue<string | null>) => () => void) {
   return streamSSE(c, async (stream) => {
+    const id = crypto.randomUUID()
     const q = new AsyncQueue<string | null>()
     let done = false
+    let queued = 0
+    let written = 0
+    let beats = 0
+    let last = Date.now()
 
-    q.push(
+    const push = (data: string | null, kind: string) => {
+      if (data !== null) {
+        queued += 1
+        if (kind === "server.heartbeat") {
+          beats += 1
+          log.debug("global event heartbeat queued", { id, queued, written, beats })
+        }
+      }
+      q.push(data)
+    }
+
+    push(
       JSON.stringify({
         payload: {
           type: "server.connected",
           properties: {},
         },
       }),
+      "server.connected",
     )
 
     // Send heartbeat every 10s to prevent stalled proxy streams.
     const heartbeat = setInterval(() => {
-      q.push(
+      push(
         JSON.stringify({
           payload: {
             type: "server.heartbeat",
             properties: {},
           },
         }),
+        "server.heartbeat",
       )
     }, 10_000)
 
@@ -48,8 +66,14 @@ async function streamEvents(c: Context, subscribe: (q: AsyncQueue<string | null>
       done = true
       clearInterval(heartbeat)
       unsub()
-      q.push(null)
-      log.info("global event disconnected")
+      push(null, "stop")
+      log.info("global event disconnected", {
+        id,
+        queued,
+        written,
+        beats,
+        idle: Date.now() - last,
+      })
     }
 
     const unsub = subscribe(q)
@@ -59,7 +83,20 @@ async function streamEvents(c: Context, subscribe: (q: AsyncQueue<string | null>
     try {
       for await (const data of q) {
         if (data === null) return
+        const next = Date.now()
+        const idle = next - last
+        last = next
+        if (idle > 10_000) {
+          log.info("global event stream write gap", {
+            id,
+            idle,
+            queued,
+            written,
+            beats,
+          })
+        }
         await stream.writeSSE({ data })
+        written += 1
       }
     } finally {
       stop()
